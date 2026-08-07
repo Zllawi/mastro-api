@@ -24,16 +24,18 @@ class FirebasePushConfig {
     final path = environment['FIREBASE_SERVICE_ACCOUNT_JSON_PATH']?.trim();
     final encoded = environment['FIREBASE_SERVICE_ACCOUNT_JSON_BASE64']?.trim();
     String? rawJson;
-    if (path != null && path.isNotEmpty) {
+    if (encoded != null && encoded.isNotEmpty) {
+      rawJson = utf8.decode(base64Decode(encoded));
+    } else if (path != null && path.isNotEmpty) {
       final file = File(path);
       if (!await file.exists()) {
-        throw StateError(
-          'FIREBASE_SERVICE_ACCOUNT_JSON_PATH does not point to an existing file.',
+        stderr.writeln(
+          'FIREBASE_SERVICE_ACCOUNT_JSON_PATH does not point to an existing file; Firebase push is disabled. '
+          'On Render, set FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 instead or leave the path empty.',
         );
+        return null;
       }
       rawJson = await file.readAsString();
-    } else if (encoded != null && encoded.isNotEmpty) {
-      rawJson = utf8.decode(base64Decode(encoded));
     } else {
       return null;
     }
