@@ -7,6 +7,7 @@ RUN dart pub get
 
 COPY . .
 RUN dart pub get --offline
+RUN mkdir -p /app/bin
 RUN dart compile exe server/http_server.dart -o /app/bin/mastro_api
 
 FROM dart:stable
