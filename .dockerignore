@@ -1,0 +1,10 @@
+.dart_tool/
+.env
+.env.*
+!.env.example
+*.log
+build/
+coverage/
+.git/
+firebase-service-account*.json
+*-firebase-adminsdk-*.json

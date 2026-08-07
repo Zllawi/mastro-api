@@ -1,0 +1,16 @@
+name: mastro_api
+description: MASTRO backend API for Render deployment.
+publish_to: none
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  crypto: ^3.0.7
+  dio: ^5.9.2
+  googleapis_auth: ^2.3.3
+  http: ^1.6.0
+  postgres: ^3.5.12
+
+dev_dependencies:
+  lints: ^6.0.0
