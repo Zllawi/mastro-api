@@ -2719,7 +2719,21 @@ class PlatformRepository {
         statusCode: 422,
       );
     }
-    return db.run((session) async {
+    return db.runTx((session) async {
+      await session.execute(
+        '''
+        update public.notification_devices
+        set enabled = false, last_seen_at = now()
+        where profile_id = @profileId
+          and platform = @platform
+          and push_token <> @pushToken
+        ''',
+        parameters: {
+          'profileId': profileId,
+          'platform': platform,
+          'pushToken': token,
+        },
+      );
       final rows = await session.select(
         '''
         insert into public.notification_devices (
