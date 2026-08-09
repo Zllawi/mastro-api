@@ -4571,9 +4571,10 @@ class PlatformRepository {
         '''
         update public.profiles
         set
-          status = @status,
+          status = cast(@status as public.account_status),
           blocked_reason = case
-            when @status = 'suspended' then @reason
+            when cast(@status as public.account_status) = 'suspended'::public.account_status
+              then @reason
             else null
           end
         where id = @profileId and role <> 'admin'
