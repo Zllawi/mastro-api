@@ -4840,6 +4840,140 @@ class PlatformRepository {
     );
   }
 
+  Future<Map<String, dynamic>> adminUpdateCampaign({
+    required String adminId,
+    required String campaignId,
+    required Map<String, dynamic> input,
+  }) {
+    return db.runTx((session) async {
+      final rows = await session.select(
+        '''
+        update public.notification_campaigns
+        set
+          title = @title,
+          body = @body,
+          audience = @audience,
+          target_profile_id = cast(@targetProfileId as uuid),
+          data = coalesce(cast(@data as jsonb), data),
+          scheduled_for = @scheduledFor
+        where id = @campaignId
+        returning *
+        ''',
+        parameters: {
+          'campaignId': campaignId,
+          'title': input['title'],
+          'body': input['body'],
+          'audience': input['audience'],
+          'targetProfileId': input['target_profile_id'],
+          'data': input.containsKey('data') ? _jsonText(input['data']) : null,
+          'scheduledFor':
+              _dateOrNull(input['scheduled_for']) ?? DateTime.now().toUtc(),
+        },
+      );
+      if (rows.isEmpty) {
+        throw const PlatformRuleException(
+          'الإشعار غير موجود.',
+          statusCode: 404,
+        );
+      }
+      await session.execute(
+        '''
+        update public.notifications
+        set
+          title = @title,
+          body = @body,
+          data = coalesce(cast(@data as jsonb), data)
+        where campaign_id = @campaignId
+        ''',
+        parameters: {
+          'campaignId': campaignId,
+          'title': input['title'],
+          'body': input['body'],
+          'data': input.containsKey('data') ? _jsonText(input['data']) : null,
+        },
+      );
+      await _audit(
+        session,
+        adminId: adminId,
+        action: 'notification.update',
+        entityType: 'notification_campaign',
+        entityId: campaignId,
+        details: {'audience': input['audience']},
+      );
+      return rows.single;
+    });
+  }
+
+  Future<Map<String, dynamic>> adminResendCampaign({
+    required String adminId,
+    required String campaignId,
+  }) {
+    return db.runTx((session) async {
+      final rows = await session.select(
+        '''
+        update public.notification_campaigns
+        set
+          status = 'scheduled',
+          scheduled_for = now(),
+          sent_at = null,
+          error_message = null
+        where id = @campaignId
+        returning *
+        ''',
+        parameters: {'campaignId': campaignId},
+      );
+      if (rows.isEmpty) {
+        throw const PlatformRuleException(
+          'الإشعار غير موجود.',
+          statusCode: 404,
+        );
+      }
+      await _audit(
+        session,
+        adminId: adminId,
+        action: 'notification.resend',
+        entityType: 'notification_campaign',
+        entityId: campaignId,
+      );
+      return rows.single;
+    });
+  }
+
+  Future<void> adminDeleteCampaign({
+    required String adminId,
+    required String campaignId,
+  }) {
+    return db.runTx((session) async {
+      await session.execute(
+        '''
+        delete from public.notifications
+        where campaign_id = @campaignId
+        ''',
+        parameters: {'campaignId': campaignId},
+      );
+      final changed = await session.execute(
+        '''
+        delete from public.notification_campaigns
+        where id = @campaignId
+        ''',
+        parameters: {'campaignId': campaignId},
+      );
+      if (changed == 0) {
+        throw const PlatformRuleException(
+          'الإشعار غير موجود.',
+          statusCode: 404,
+        );
+      }
+      await _audit(
+        session,
+        adminId: adminId,
+        action: 'notification.delete',
+        entityType: 'notification_campaign',
+        entityId: campaignId,
+      );
+    });
+  }
+
   Future<int> dispatchDueCampaigns() {
     return db.runTx((session) async {
       final campaigns = await session.select('''
@@ -4997,19 +5131,33 @@ class PlatformRepository {
     required String categoryId,
   }) {
     return db.runTx((session) async {
+      final requestCountRows = await session.select(
+        '''
+        select count(*)::int as count
+        from public.service_requests
+        where category_id = @categoryId
+        ''',
+        parameters: {'categoryId': categoryId},
+      );
+      final requestCount = requestCountRows.isEmpty
+          ? 0
+          : (requestCountRows.single['count'] as num?)?.toInt() ?? 0;
+      if (requestCount > 0) {
+        throw const PlatformRuleException(
+          'لا يمكن حذف الحرفة نهائيًا لأنها مرتبطة بطلبات سابقة. يمكنك تعطيلها من زر التعديل للحفاظ على سجل الطلبات.',
+          statusCode: 409,
+        );
+      }
       final changed = await session.execute(
         '''
-        update public.service_categories
-        set
-          is_active = false,
-          availability_status = 'closed'
+        delete from public.service_categories
         where id = @categoryId
         ''',
         parameters: {'categoryId': categoryId},
       );
       if (changed == 0) {
         throw const PlatformRuleException(
-          'Service category not found.',
+          'الحرفة غير موجودة.',
           statusCode: 404,
         );
       }

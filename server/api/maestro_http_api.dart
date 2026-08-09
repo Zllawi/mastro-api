@@ -1351,15 +1351,51 @@ class MaestroHttpApi {
     }
     if (path == '/admin/notifications' && request.method == 'POST') {
       final body = await _readJsonObject(request);
-      _requireText(body, 'title', 'عنوان الإشعار مطلوب.');
-      _requireText(body, 'body', 'نص الإشعار مطلوب.');
-      _requireText(body, 'audience', 'جمهور الإشعار مطلوب.');
+      _validateNotificationCampaign(body);
       final campaign = await repository.adminCreateCampaign(
         adminId: adminId,
         input: body,
       );
       await repository.dispatchDueCampaigns();
       await _json(request.response, HttpStatus.created, {'campaign': campaign});
+      return true;
+    }
+    final resendCampaignId = _pathBetween(
+      path,
+      '/admin/notifications/',
+      '/resend',
+    );
+    if (resendCampaignId != null && request.method == 'POST') {
+      await repository.adminResendCampaign(
+        adminId: adminId,
+        campaignId: resendCampaignId,
+      );
+      final delivered = await repository.dispatchDueCampaigns();
+      await _json(request.response, HttpStatus.ok, {
+        'resent': true,
+        'delivered': delivered,
+      });
+      return true;
+    }
+    final notificationCampaignId = _pathId(path, '/admin/notifications/');
+    if (notificationCampaignId != null && request.method == 'PUT') {
+      final body = await _readJsonObject(request);
+      _validateNotificationCampaign(body);
+      await _json(request.response, HttpStatus.ok, {
+        'campaign': await repository.adminUpdateCampaign(
+          adminId: adminId,
+          campaignId: notificationCampaignId,
+          input: body,
+        ),
+      });
+      return true;
+    }
+    if (notificationCampaignId != null && request.method == 'DELETE') {
+      await repository.adminDeleteCampaign(
+        adminId: adminId,
+        campaignId: notificationCampaignId,
+      );
+      await _json(request.response, HttpStatus.ok, {'deleted': true});
       return true;
     }
     if (path == '/admin/categories' && request.method == 'POST') {
@@ -1795,6 +1831,32 @@ void _validateCategory(Map<String, dynamic> body) {
     body['icon_url'] = iconUrl;
   } else {
     body['icon_url'] = null;
+  }
+}
+
+void _validateNotificationCampaign(Map<String, dynamic> body) {
+  _requireText(body, 'title', 'عنوان الإشعار مطلوب.');
+  _requireText(body, 'body', 'نص الإشعار مطلوب.');
+  final audience = _requireText(body, 'audience', 'جمهور الإشعار مطلوب.');
+  if (!const {'all', 'customers', 'craftsmen', 'profile'}.contains(audience)) {
+    throw const PlatformRuleException(
+      'جمهور الإشعار غير صالح.',
+      statusCode: 422,
+    );
+  }
+  if (audience == 'profile') {
+    _requireText(body, 'target_profile_id', 'اختر المستخدم المستلم للإشعار.');
+  } else {
+    body['target_profile_id'] = null;
+  }
+  final scheduledFor = body['scheduled_for'];
+  if (scheduledFor != null &&
+      scheduledFor.toString().trim().isNotEmpty &&
+      DateTime.tryParse(scheduledFor.toString()) == null) {
+    throw const PlatformRuleException(
+      'موعد إرسال الإشعار غير صالح.',
+      statusCode: 422,
+    );
   }
 }
 
