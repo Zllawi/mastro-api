@@ -666,6 +666,7 @@ class MaestroHttpApi {
         .toString()
         .replaceAll(RegExp(r'\D'), '');
     final role = _validatedRole(body['role']?.toString());
+    _enforceAppRole(request, role);
     if (phone == null || code.length < 4) {
       throw const PlatformRuleException(
         'رقم الهاتف أو رمز التحقق غير صحيح.',
@@ -715,6 +716,7 @@ class MaestroHttpApi {
       );
     }
     final role = _validatedRole(body['role']?.toString());
+    _enforceAppRole(request, role);
     final testLoginPolicy = TestLoginPolicy.fromEnvironment(environment);
     if (!testLoginPolicy.allows(phone: phone, role: role)) {
       throw const PlatformRuleException(
@@ -735,6 +737,7 @@ class MaestroHttpApi {
       );
     }
     final role = _validatedRole(body['role']?.toString());
+    _enforceAppRole(request, role);
     final password = _requirePassword(body);
     final profile = await repository.passwordLoginProfile(
       phone: phone,
@@ -1679,6 +1682,19 @@ String _validatedRole(String? raw) {
     throw const PlatformRuleException('نوع الحساب غير صالح.', statusCode: 422);
   }
   return role;
+}
+
+void _enforceAppRole(HttpRequest request, String role) {
+  final appKind = request.headers
+      .value('X-Maestro-App-Kind')
+      ?.trim()
+      .toLowerCase();
+  if (appKind == 'craftsman' && role != 'craftsman') {
+    throw const PlatformRuleException(
+      'تطبيق الفني مخصص لحسابات الفنيين فقط.',
+      statusCode: 403,
+    );
+  }
 }
 
 void _requireRole(String actual, String expected) {
