@@ -4609,8 +4609,8 @@ class PlatformRepository {
           @body,
           jsonb_build_object(
             'notification_type', 'account_status',
-            'account_status', @status,
-            'reason', @reason
+            'account_status', cast(@status as text),
+            'reason', cast(@reason as text)
           )
         )
         ''',
