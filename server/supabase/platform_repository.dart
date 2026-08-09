@@ -4860,6 +4860,36 @@ class PlatformRepository {
     required Map<String, dynamic> input,
   }) {
     return db.runTx((session) async {
+      final existingRows = await session.select(
+        '''
+        select
+          c.*,
+          (
+            select count(*)::int
+            from public.notifications n
+            where n.campaign_id = c.id
+          ) as delivered_notifications
+        from public.notification_campaigns c
+        where c.id = @campaignId
+        for update
+        ''',
+        parameters: {'campaignId': campaignId},
+      );
+      if (existingRows.isEmpty) {
+        throw const PlatformRuleException(
+          'الإشعار غير موجود.',
+          statusCode: 404,
+        );
+      }
+      final existing = existingRows.single;
+      final previousTargetProfileId = existing['target_profile_id']?.toString();
+      final nextTargetProfileId = input['target_profile_id']?.toString();
+      final recipientsChanged =
+          existing['audience']?.toString() != input['audience']?.toString() ||
+          (previousTargetProfileId ?? '') != (nextTargetProfileId ?? '');
+      final deliveredNotifications =
+          int.tryParse(existing['delivered_notifications']?.toString() ?? '') ??
+          0;
       final rows = await session.select(
         '''
         update public.notification_campaigns
@@ -4890,29 +4920,82 @@ class PlatformRepository {
           statusCode: 404,
         );
       }
-      await session.execute(
-        '''
-        update public.notifications
-        set
-          title = @title,
-          body = @body,
-          data = coalesce(cast(@data as jsonb), data)
-        where campaign_id = @campaignId
-        ''',
-        parameters: {
-          'campaignId': campaignId,
-          'title': input['title'],
-          'body': input['body'],
-          'data': input.containsKey('data') ? _jsonText(input['data']) : null,
-        },
-      );
+      if (deliveredNotifications > 0 && recipientsChanged) {
+        await session.execute(
+          '''
+          delete from public.notifications
+          where campaign_id = @campaignId
+          ''',
+          parameters: {'campaignId': campaignId},
+        );
+        await session.execute(
+          '''
+          insert into public.notifications (
+            profile_id,
+            campaign_id,
+            title,
+            body,
+            data,
+            push_status
+          )
+          select
+            p.id,
+            @campaignId,
+            @title,
+            @body,
+            cast(@data as jsonb),
+            'skipped'
+          from public.profiles p
+          left join public.notification_preferences np on np.profile_id = p.id
+          where p.status = 'active'
+            and p.notifications_enabled = true
+            and coalesce(np.promotions, true) = true
+            and (
+              @audience = 'all'
+              or (@audience = 'customers' and p.role = 'customer')
+              or (@audience = 'craftsmen' and p.role = 'craftsman')
+              or (@audience = 'profile' and p.id = cast(@targetProfileId as uuid))
+            )
+          ''',
+          parameters: {
+            'campaignId': campaignId,
+            'title': input['title'],
+            'body': input['body'],
+            'data': input.containsKey('data')
+                ? _jsonText(input['data'])
+                : _jsonText(existing['data'] ?? <String, dynamic>{}),
+            'audience': input['audience'],
+            'targetProfileId': input['target_profile_id'],
+          },
+        );
+      } else {
+        await session.execute(
+          '''
+          update public.notifications
+          set
+            title = @title,
+            body = @body,
+            data = coalesce(cast(@data as jsonb), data)
+          where campaign_id = @campaignId
+          ''',
+          parameters: {
+            'campaignId': campaignId,
+            'title': input['title'],
+            'body': input['body'],
+            'data': input.containsKey('data') ? _jsonText(input['data']) : null,
+          },
+        );
+      }
       await _audit(
         session,
         adminId: adminId,
         action: 'notification.update',
         entityType: 'notification_campaign',
         entityId: campaignId,
-        details: {'audience': input['audience']},
+        details: {
+          'audience': input['audience'],
+          'recipients_changed': recipientsChanged,
+        },
       );
       return rows.single;
     });
