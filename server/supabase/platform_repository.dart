@@ -2797,8 +2797,14 @@ class PlatformRepository {
           left join public.notification_preferences np
             on np.profile_id = n.profile_id
           where n.push_attempts < 3
-            and p.status = 'active'
-            and p.notifications_enabled = true
+            and (
+              p.status = 'active'
+              or n.data ->> 'notification_type' = 'account_status'
+            )
+            and (
+              p.notifications_enabled = true
+              or n.data ->> 'notification_type' = 'account_status'
+            )
             and (
               n.push_status = 'pending'
               or (
@@ -2814,6 +2820,8 @@ class PlatformRepository {
             )
             and (
               case
+                when n.data ->> 'notification_type' = 'account_status'
+                  then true
                 when n.campaign_id is not null
                   or n.data ->> 'notification_type' = 'promotion'
                   then coalesce(np.promotions, true)
@@ -4591,6 +4599,35 @@ class PlatformRepository {
           statusCode: 404,
         );
       }
+      final cleanReason = reason?.trim();
+      await session.execute(
+        '''
+        insert into public.notifications (profile_id, title, body, data)
+        values (
+          @profileId,
+          @title,
+          @body,
+          jsonb_build_object(
+            'notification_type', 'account_status',
+            'account_status', @status,
+            'reason', @reason
+          )
+        )
+        ''',
+        parameters: {
+          'profileId': profileId,
+          'status': status,
+          'reason': cleanReason?.isEmpty == true ? null : cleanReason,
+          'title': status == 'suspended'
+              ? 'تم إيقاف حسابك مؤقتًا'
+              : 'تم إعادة تفعيل حسابك',
+          'body': status == 'suspended'
+              ? (cleanReason?.isNotEmpty == true
+                    ? 'سبب الإيقاف: $cleanReason'
+                    : 'تم إيقاف الحساب من الإدارة. تواصل مع الدعم للمراجعة.')
+              : 'تم إعادة تفعيل حسابك ويمكنك استخدام MASTRO الآن.',
+        },
+      );
       if (status == 'suspended') {
         await session.execute(
           '''

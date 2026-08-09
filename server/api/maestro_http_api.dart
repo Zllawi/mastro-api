@@ -1276,6 +1276,7 @@ class MaestroHttpApi {
         status: _requireText(body, 'status', 'الحالة مطلوبة.'),
         reason: body['reason']?.toString(),
       );
+      await _dispatchDueCampaignsAndPush();
       await _json(request.response, HttpStatus.ok, {'updated': true});
       return true;
     }
