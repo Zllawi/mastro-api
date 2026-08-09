@@ -4911,14 +4911,10 @@ class PlatformRepository {
     return db.runTx((session) async {
       final rows = await session.select(
         '''
-        update public.notification_campaigns
-        set
-          status = 'scheduled',
-          scheduled_for = now(),
-          sent_at = null,
-          error_message = null
+        select *
+        from public.notification_campaigns
         where id = @campaignId
-        returning *
+        for update
         ''',
         parameters: {'campaignId': campaignId},
       );
@@ -4928,14 +4924,73 @@ class PlatformRepository {
           statusCode: 404,
         );
       }
+      await session.execute(
+        '''
+        with ranked as (
+          select
+            id,
+            row_number() over (
+              partition by profile_id
+              order by created_at desc, id desc
+            ) as row_number
+          from public.notifications
+          where campaign_id = @campaignId
+        )
+        delete from public.notifications n
+        using ranked r
+        where n.id = r.id
+          and r.row_number > 1
+        ''',
+        parameters: {'campaignId': campaignId},
+      );
+      final queued = await session.execute(
+        '''
+        update public.notifications
+        set
+          push_status = 'pending',
+          push_attempts = 0,
+          push_claimed_at = null,
+          push_sent_at = null,
+          push_error = null
+        where campaign_id = @campaignId
+        ''',
+        parameters: {'campaignId': campaignId},
+      );
+      final updatedRows = queued == 0
+          ? await session.select(
+              '''
+              update public.notification_campaigns
+              set
+                status = 'scheduled',
+                scheduled_for = now(),
+                sent_at = null,
+                error_message = null
+              where id = @campaignId
+              returning *
+              ''',
+              parameters: {'campaignId': campaignId},
+            )
+          : await session.select(
+              '''
+              update public.notification_campaigns
+              set
+                status = 'sent',
+                sent_at = now(),
+                error_message = null
+              where id = @campaignId
+              returning *
+              ''',
+              parameters: {'campaignId': campaignId},
+            );
       await _audit(
         session,
         adminId: adminId,
         action: 'notification.resend',
         entityType: 'notification_campaign',
         entityId: campaignId,
+        details: {'queued_push_notifications': queued},
       );
-      return rows.single;
+      return updatedRows.single;
     });
   }
 
