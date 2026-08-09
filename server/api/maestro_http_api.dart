@@ -7,6 +7,7 @@ import '../auth/password_hasher.dart';
 import '../auth/session_service.dart';
 import '../auth/test_login_policy.dart';
 import '../cloudinary/cloudinary_client.dart';
+import '../firebase/firebase_push_service.dart';
 import '../resala/otp_flow.dart';
 import '../resala/resala_client.dart';
 import '../supabase/platform_repository.dart';
@@ -18,6 +19,7 @@ class MaestroHttpApi {
     required this.repository,
     required this.sessions,
     required this.cloudinary,
+    this.pushDispatcher,
   });
 
   final Map<String, String> environment;
@@ -25,6 +27,7 @@ class MaestroHttpApi {
   final PlatformRepository repository;
   final SessionService sessions;
   final CloudinaryClient cloudinary;
+  final NotificationPushDispatcher? pushDispatcher;
 
   bool get _isProduction =>
       !TestLoginPolicy.fromEnvironment(environment).environmentAllowsTestLogin;
@@ -44,6 +47,7 @@ class MaestroHttpApi {
           'ok': true,
           'environment': _isProduction ? 'production' : 'non-production',
           'cloudinary_configured': cloudinary.config.isConfigured,
+          'firebase_push_configured': pushDispatcher != null,
         });
         return;
       }
@@ -1038,7 +1042,7 @@ class MaestroHttpApi {
       customerId: profileId,
       input: body,
     );
-    await repository.dispatchDueCampaigns();
+    await _dispatchDueCampaignsAndPush();
     await _json(request.response, HttpStatus.created, {'request': created});
   }
 
@@ -1356,7 +1360,7 @@ class MaestroHttpApi {
         adminId: adminId,
         input: body,
       );
-      await repository.dispatchDueCampaigns();
+      await _dispatchDueCampaignsAndPush();
       await _json(request.response, HttpStatus.created, {'campaign': campaign});
       return true;
     }
@@ -1370,7 +1374,7 @@ class MaestroHttpApi {
         adminId: adminId,
         campaignId: resendCampaignId,
       );
-      final delivered = await repository.dispatchDueCampaigns();
+      final delivered = await _dispatchDueCampaignsAndPush();
       await _json(request.response, HttpStatus.ok, {
         'resent': true,
         'delivered': delivered,
@@ -1575,6 +1579,12 @@ class MaestroHttpApi {
       return true;
     }
     return false;
+  }
+
+  Future<int> _dispatchDueCampaignsAndPush() async {
+    final delivered = await repository.dispatchDueCampaigns();
+    await pushDispatcher?.dispatchPending();
+    return delivered;
   }
 }
 

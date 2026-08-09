@@ -55,6 +55,7 @@ Future<void> main() async {
     repository: repository,
     sessions: SessionService(repository: repository),
     cloudinary: cloudinary,
+    pushDispatcher: pushDispatcher,
   );
 
   late final HttpServer server;
