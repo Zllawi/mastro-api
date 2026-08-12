@@ -207,23 +207,34 @@ class PlatformRepository {
         }
         final inserted = await session.select(
           '''
-          insert into public.profiles (
-            role,
-            status,
-            phone,
-            phone_verified_at,
-            last_login_at,
-            password_reset_required
+          with profile as (
+            insert into public.profiles (
+              role,
+              status,
+              phone,
+              phone_verified_at,
+              last_login_at,
+              password_reset_required
+            )
+            values (
+              @role,
+              'active',
+              @phone,
+              now(),
+              now(),
+              true
+            )
+            returning *
+          ), wallet as (
+            insert into public.wallets (profile_id)
+            select id from profile
+            on conflict (profile_id) do nothing
+          ), preferences as (
+            insert into public.notification_preferences (profile_id)
+            select id from profile
+            on conflict (profile_id) do nothing
           )
-          values (
-            @role,
-            'active',
-            @phone,
-            now(),
-            now(),
-            true
-          )
-          returning *
+          select * from profile
           ''',
           parameters: {'role': requestedRole, 'phone': phone},
         );
@@ -260,39 +271,34 @@ class PlatformRepository {
         }
         final updated = await session.select(
           '''
-          update public.profiles
-          set
-            phone_verified_at = coalesce(phone_verified_at, now()),
-            last_login_at = now(),
-            status = case when status = 'pending' then 'active' else status end,
-            password_reset_required = case
-              when role = 'admin' then false
-              else password_hash is null
-            end
-          where id = @profileId
-          returning *
+          with profile as (
+            update public.profiles
+            set
+              phone_verified_at = coalesce(phone_verified_at, now()),
+              last_login_at = now(),
+              status = case when status = 'pending' then 'active' else status end,
+              password_reset_required = case
+                when role = 'admin' then false
+                else password_hash is null
+              end
+            where id = @profileId
+            returning *
+          ), wallet as (
+            insert into public.wallets (profile_id)
+            select id from profile
+            on conflict (profile_id) do nothing
+          ), preferences as (
+            insert into public.notification_preferences (profile_id)
+            select id from profile
+            on conflict (profile_id) do nothing
+          )
+          select * from profile
           ''',
           parameters: {'profileId': profile['id']},
         );
         profile = updated.single;
       }
 
-      await session.execute(
-        '''
-        insert into public.wallets (profile_id)
-        values (@profileId)
-        on conflict (profile_id) do nothing
-        ''',
-        parameters: {'profileId': profile['id']},
-      );
-      await session.execute(
-        '''
-        insert into public.notification_preferences (profile_id)
-        values (@profileId)
-        on conflict (profile_id) do nothing
-        ''',
-        parameters: {'profileId': profile['id']},
-      );
       return profile;
     });
   }
@@ -334,10 +340,18 @@ class PlatformRepository {
   }
 
   Future<Map<String, dynamic>?> authenticate(String tokenHash) {
-    return db.runTx((session) async {
+    return db.run((session) async {
       final rows = await session.select(
         '''
-        select
+        update public.app_sessions s
+        set last_seen_at = now()
+        from public.profiles p
+        where s.token_hash = @tokenHash
+          and s.revoked_at is null
+          and s.expires_at > now()
+          and p.id = s.profile_id
+          and p.status <> 'suspended'
+        returning
           s.id as session_id,
           s.profile_id,
           s.expires_at,
@@ -351,43 +365,32 @@ class PlatformRepository {
             else p.password_reset_required
           end as password_reset_required,
           (p.password_hash is not null) as has_password
-        from public.app_sessions s
-        join public.profiles p on p.id = s.profile_id
-        where s.token_hash = @tokenHash
-          and s.revoked_at is null
-          and s.expires_at > now()
-        limit 1
-        for update of s
         ''',
         parameters: {'tokenHash': tokenHash},
       );
-      if (rows.isEmpty) return null;
-      final auth = rows.single;
-      if (auth['status'].toString() == 'suspended') {
-        await session.execute(
-          '''
-          update public.app_sessions
-          set revoked_at = now()
-          where id = @sessionId
-          ''',
-          parameters: {'sessionId': auth['session_id']},
-        );
-        throw PlatformRuleException(
-          auth['blocked_reason']?.toString().trim().isNotEmpty == true
-              ? 'الحساب محظور: ${auth['blocked_reason']}'
-              : 'هذا الحساب محظور.',
-          statusCode: 403,
-        );
-      }
-      await session.execute(
+      if (rows.isNotEmpty) return rows.single;
+      final suspended = await session.select(
         '''
-        update public.app_sessions
-        set last_seen_at = now()
-        where id = @sessionId
+        update public.app_sessions s
+        set revoked_at = now()
+        from public.profiles p
+        where s.token_hash = @tokenHash
+          and s.revoked_at is null
+          and s.expires_at > now()
+          and p.id = s.profile_id
+          and p.status = 'suspended'
+        returning p.blocked_reason
         ''',
-        parameters: {'sessionId': auth['session_id']},
+        parameters: {'tokenHash': tokenHash},
       );
-      return auth;
+      if (suspended.isEmpty) return null;
+      final blockedReason = suspended.single['blocked_reason']?.toString();
+      throw PlatformRuleException(
+        blockedReason?.trim().isNotEmpty == true
+            ? 'الحساب محظور: $blockedReason'
+            : 'هذا الحساب محظور.',
+        statusCode: 403,
+      );
     });
   }
 
@@ -473,24 +476,119 @@ class PlatformRepository {
       final profileRows = await session.select(
         '''
         select
-          id,
-          phone,
-          role,
-          status,
-          full_name,
-          avatar_url,
-          city,
-          blocked_reason,
-          case
-            when role = 'admin' then false
-            else password_reset_required
-          end as password_reset_required,
-          warning_count,
-          last_warning_at,
-          created_at,
-          updated_at
-        from public.profiles
-        where id = @profileId
+          jsonb_build_object(
+            'id', p.id,
+            'phone', p.phone,
+            'role', p.role,
+            'status', p.status,
+            'full_name', p.full_name,
+            'avatar_url', p.avatar_url,
+            'city', p.city,
+            'blocked_reason', p.blocked_reason,
+            'password_reset_required', case
+              when p.role = 'admin' then false
+              else p.password_reset_required
+            end,
+            'warning_count', p.warning_count,
+            'last_warning_at', p.last_warning_at,
+            'created_at', p.created_at,
+            'updated_at', p.updated_at
+          ) as profile,
+          case when p.role = 'customer' then (
+            select coalesce(
+              jsonb_agg(to_jsonb(a) order by a.is_default desc, a.created_at desc),
+              '[]'::jsonb
+            )
+            from public.customer_addresses a
+            where a.customer_id = p.id
+          ) else '[]'::jsonb end as addresses,
+          case when p.role = 'craftsman' then (
+            select to_jsonb(cp) || jsonb_build_object(
+              'category_ids', coalesce(
+                (
+                  select jsonb_agg(cs.category_id order by cs.category_id)
+                  from public.craftsman_services cs
+                  where cs.craftsman_id = cp.profile_id
+                ),
+                '[]'::jsonb
+              ),
+              'documents', coalesce(
+                (
+                  select jsonb_agg(
+                    jsonb_build_object(
+                      'id', d.id,
+                      'document_type', d.document_type,
+                      'public_url', d.public_url,
+                      'status', d.status,
+                      'rejection_reason', d.rejection_reason
+                    )
+                    order by d.created_at
+                  )
+                  from public.craftsman_verification_documents d
+                  where d.craftsman_id = cp.profile_id
+                ),
+                '[]'::jsonb
+              )
+            )
+            from public.craftsman_profiles cp
+            where cp.profile_id = p.id
+          ) end as craftsman_profile,
+          (
+            select to_jsonb(w)
+            from public.wallets w
+            where w.profile_id = p.id
+          ) as wallet,
+          (
+            select to_jsonb(np)
+            from public.notification_preferences np
+            where np.profile_id = p.id
+          ) as notification_preferences,
+          (
+            select coalesce(
+              jsonb_agg(to_jsonb(sc) order by sc.sort_order, sc.name_ar),
+              '[]'::jsonb
+            )
+            from public.service_categories sc
+            where sc.is_active = true
+          ) as categories,
+          (
+            select aps.value
+            from public.app_settings aps
+            where aps.key = 'home_banners'
+          ) as home_banners,
+          case when p.role = 'customer' then (
+            select coalesce(
+              jsonb_agg(
+                jsonb_build_object(
+                  'id', favorite_profile.id,
+                  'full_name', favorite_profile.full_name,
+                  'avatar_url', favorite_profile.avatar_url,
+                  'profession', favorite_cp.profession,
+                  'rating', favorite_cp.rating,
+                  'completed_jobs', favorite_cp.completed_jobs,
+                  'on_time_percent', favorite_cp.on_time_percent,
+                  'is_verified', favorite_cp.is_verified,
+                  'saved_at', fc.created_at
+                )
+                order by fc.created_at desc
+              ),
+              '[]'::jsonb
+            )
+            from public.favorite_craftsmen fc
+            join public.profiles favorite_profile
+              on favorite_profile.id = fc.craftsman_id
+            join public.craftsman_profiles favorite_cp
+              on favorite_cp.profile_id = fc.craftsman_id
+            where fc.customer_id = p.id
+              and favorite_profile.status = 'active'
+          ) else '[]'::jsonb end as favorites,
+          (
+            select count(*)::int
+            from public.notifications n
+            where n.profile_id = p.id and n.read_at is null
+          ) as unread_notifications
+        from public.profiles p
+        where p.id = @profileId
         limit 1
         ''',
         parameters: {'profileId': profileId},
@@ -498,90 +596,26 @@ class PlatformRepository {
       if (profileRows.isEmpty) {
         throw const PlatformRuleException('الحساب غير موجود.', statusCode: 404);
       }
-      final addresses = await session.select(
-        '''
-        select *
-        from public.customer_addresses
-        where customer_id = @profileId
-        order by is_default desc, created_at desc
-        ''',
-        parameters: {'profileId': profileId},
-      );
-      final craftsmanRows = await session.select(
-        '''
-        select cp.*,
-          coalesce(
-            (
-              select jsonb_agg(cs.category_id order by cs.category_id)
-              from public.craftsman_services cs
-              where cs.craftsman_id = cp.profile_id
-            ),
-            '[]'::jsonb
-          ) as category_ids,
-          coalesce(
-            (
-              select jsonb_agg(
-                jsonb_build_object(
-                  'id', d.id,
-                  'document_type', d.document_type,
-                  'public_url', d.public_url,
-                  'status', d.status,
-                  'rejection_reason', d.rejection_reason
-                )
-                order by d.created_at
-              )
-              from public.craftsman_verification_documents d
-              where d.craftsman_id = cp.profile_id
-            ),
-            '[]'::jsonb
-          ) as documents
-        from public.craftsman_profiles cp
-        where cp.profile_id = @profileId
-        limit 1
-        ''',
-        parameters: {'profileId': profileId},
-      );
-      final walletRows = await session.select(
-        'select * from public.wallets where profile_id = @profileId limit 1',
-        parameters: {'profileId': profileId},
-      );
-      final preferences = await session.select(
-        '''
-        select *
-        from public.notification_preferences
-        where profile_id = @profileId
-        limit 1
-        ''',
-        parameters: {'profileId': profileId},
-      );
-      await _dispatchDueRequestBatches(session);
-      final requests = await _requestsForProfile(session, profileId);
-      final categories = await _listCategories(session);
-      final homeBanners = await _listHomeBanners(session);
-      final favorites = await _favoritesForCustomer(session, profileId);
-      final unread = await session.select(
-        '''
-        select count(*)::int as count
-        from public.notifications
-        where profile_id = @profileId and read_at is null
-        ''',
-        parameters: {'profileId': profileId},
+      final summary = profileRows.single;
+      final profile = _jsonObject(summary['profile'])!;
+      final requests = await _requestsForProfile(
+        session,
+        profileId,
+        knownRole: profile['role']?.toString() ?? '',
       );
       return {
-        'profile': profileRows.single,
-        'addresses': addresses,
-        'craftsman_profile': craftsmanRows.isEmpty
-            ? null
-            : craftsmanRows.single,
-        'wallet': walletRows.isEmpty ? null : walletRows.single,
-        'notification_preferences': preferences.isEmpty
-            ? null
-            : preferences.single,
+        'profile': profile,
+        'addresses': _jsonObjectList(summary['addresses']),
+        'craftsman_profile': _jsonObject(summary['craftsman_profile']),
+        'wallet': _jsonObject(summary['wallet']),
+        'notification_preferences': _jsonObject(
+          summary['notification_preferences'],
+        ),
         'requests': requests,
-        'categories': categories,
-        'home_banners': homeBanners,
-        'favorites': favorites,
-        'unread_notifications': unread.single['count'],
+        'categories': _jsonObjectList(summary['categories']),
+        'home_banners': _homeBanners(summary['home_banners']),
+        'favorites': _jsonObjectList(summary['favorites']),
+        'unread_notifications': _intValue(summary['unread_notifications']),
       };
     });
   }
@@ -6535,14 +6569,18 @@ class PlatformRepository {
 
   Future<List<Map<String, dynamic>>> _requestsForProfile(
     MaestroDbSession session,
-    String profileId,
-  ) async {
-    final roleRows = await session.select(
-      'select role from public.profiles where id = @profileId',
-      parameters: {'profileId': profileId},
-    );
-    if (roleRows.isEmpty) return [];
-    final role = roleRows.single['role'].toString();
+    String profileId, {
+    String? knownRole,
+  }) async {
+    var role = knownRole;
+    if (role == null) {
+      final roleRows = await session.select(
+        'select role from public.profiles where id = @profileId',
+        parameters: {'profileId': profileId},
+      );
+      if (roleRows.isEmpty) return [];
+      role = roleRows.single['role'].toString();
+    }
     if (role == 'customer') {
       return session.select(
         '''
@@ -7366,6 +7404,34 @@ String _addressText(Map<String, dynamic> address) {
 
 String _jsonText(Object? value) {
   return jsonEncode(value);
+}
+
+Map<String, dynamic>? _jsonObject(Object? raw) {
+  Object? decoded = raw;
+  if (raw is String) {
+    try {
+      decoded = jsonDecode(raw);
+    } on FormatException {
+      return null;
+    }
+  }
+  return decoded is Map ? Map<String, dynamic>.from(decoded) : null;
+}
+
+List<Map<String, dynamic>> _jsonObjectList(Object? raw) {
+  Object? decoded = raw;
+  if (raw is String) {
+    try {
+      decoded = jsonDecode(raw);
+    } on FormatException {
+      return const [];
+    }
+  }
+  if (decoded is! List) return const [];
+  return decoded
+      .whereType<Map>()
+      .map((item) => Map<String, dynamic>.from(item))
+      .toList(growable: false);
 }
 
 Map<String, dynamic> _retentionSettings(Object? raw) {

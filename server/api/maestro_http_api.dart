@@ -812,15 +812,20 @@ class MaestroHttpApi {
     HttpRequest request,
     Map<String, dynamic> profile,
   ) async {
-    final issued = await sessions.issue(
-      profileId: profile['id'].toString(),
-      deviceName: request.headers.value('X-Device-Name'),
-      ipAddress: request.connectionInfo?.remoteAddress.address,
-    );
+    final results = await Future.wait<Object>([
+      sessions.issue(
+        profileId: profile['id'].toString(),
+        deviceName: request.headers.value('X-Device-Name'),
+        ipAddress: request.connectionInfo?.remoteAddress.address,
+      ),
+      repository.bootstrap(profile['id'].toString()),
+    ]);
+    final issued = results[0] as IssuedSession;
+    final bootstrap = results[1] as Map<String, dynamic>;
     await _json(request.response, HttpStatus.ok, {
       'verified': true,
       'session': {'token': issued.token, 'expires_at': issued.expiresAt},
-      'bootstrap': await repository.bootstrap(profile['id'].toString()),
+      'bootstrap': bootstrap,
     });
   }
 

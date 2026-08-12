@@ -61,6 +61,7 @@ Future<void> main() async {
   late final HttpServer server;
   try {
     server = await HttpServer.bind(host, port);
+    server.autoCompress = true;
   } on SocketException catch (error) {
     await database.close();
     if (error.osError?.errorCode == 10048 || error.osError?.errorCode == 98) {
@@ -80,6 +81,7 @@ Future<void> main() async {
     notificationSchedulerRunning = true;
     unawaited(() async {
       try {
+        await repository.dispatchDueRequestBatches();
         await repository.dispatchDueCampaigns();
         await pushDispatcher?.dispatchPending();
       } catch (error) {
