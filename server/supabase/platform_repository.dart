@@ -2561,10 +2561,136 @@ class PlatformRepository {
         ''',
         parameters: {'profileId': profileId},
       );
+      final topupMethods = await _loadWalletTopupMethods(session);
       return {
         'wallet': walletRows.isEmpty ? null : walletRows.single,
         'transactions': transactions,
+        'topup_methods': topupMethods
+            .where((method) => method.status != 'closed')
+            .map((method) => method.toMap())
+            .toList(growable: false),
       };
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> walletTopupMethods() {
+    return db.run((session) async {
+      final methods = await _loadWalletTopupMethods(session);
+      return methods
+          .where((method) => method.status != 'closed')
+          .map((method) => method.toMap())
+          .toList(growable: false);
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> adminWalletTopupMethods() {
+    return db.run((session) async {
+      final methods = await _loadWalletTopupMethods(session);
+      return methods.map((method) => method.toMap()).toList(growable: false);
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> adminSetWalletTopupMethods({
+    required String adminId,
+    required List<Map<String, dynamic>> items,
+  }) {
+    if (items.isEmpty) {
+      throw const PlatformRuleException(
+        'أرسل طريقة شحن واحدة على الأقل.',
+        statusCode: 422,
+      );
+    }
+    return db.runTx((session) async {
+      final rows = await session.select('''
+        select value
+        from public.app_settings
+        where key = 'wallet_topup_methods'
+        limit 1
+        for update
+        ''');
+      final current = _walletTopupMethodsFromRaw(
+        rows.isEmpty ? null : rows.single['value'],
+      );
+      final byId = {for (final method in current) method.id: method};
+      final seenIds = <String>{};
+      final changed = <Map<String, dynamic>>[];
+
+      for (final input in items) {
+        final id = input['id']?.toString().trim() ?? '';
+        if (id.isEmpty || !byId.containsKey(id)) {
+          throw PlatformRuleException(
+            'طريقة الشحن "${id.isEmpty ? 'غير محددة' : id}" غير معروفة.',
+            statusCode: 422,
+          );
+        }
+        if (!seenIds.add(id)) {
+          throw PlatformRuleException(
+            'تكررت طريقة الشحن "$id" في الطلب.',
+            statusCode: 422,
+          );
+        }
+
+        final previous = byId[id]!;
+        _validateWalletTopupImmutableFields(input, previous);
+        var status = previous.status;
+        if (input.containsKey('status')) {
+          final candidate = input['status']?.toString().trim() ?? '';
+          if (!_walletTopupStatuses.contains(candidate)) {
+            throw const PlatformRuleException(
+              'حالة طريقة الشحن يجب أن تكون open أو coming_soon أو closed.',
+              statusCode: 422,
+            );
+          }
+          status = candidate;
+        }
+        if (status == 'open' && !previous.integrated) {
+          throw PlatformRuleException(
+            'طريقة الشحن «${previous.titleAr}» غير مربوطة بالخادم بعد، لذلك يمكن ضبطها على قريبًا أو مغلقة فقط.',
+            statusCode: 422,
+          );
+        }
+
+        var sortOrder = previous.sortOrder;
+        if (input.containsKey('sort_order')) {
+          final candidate = input['sort_order'];
+          final parsed = candidate is int
+              ? candidate
+              : candidate is num && candidate == candidate.roundToDouble()
+              ? candidate.toInt()
+              : int.tryParse(candidate?.toString() ?? '');
+          if (parsed == null || parsed < -100000 || parsed > 100000) {
+            throw const PlatformRuleException(
+              'ترتيب طريقة الشحن غير صالح.',
+              statusCode: 422,
+            );
+          }
+          sortOrder = parsed;
+        }
+
+        final updated = previous.copyWith(status: status, sortOrder: sortOrder);
+        byId[id] = updated;
+        changed.add(updated.toMap());
+      }
+
+      final updated =
+          _walletTopupMethodDefaults
+              .map((method) => byId[method.id] ?? method)
+              .toList(growable: false)
+            ..sort(_compareWalletTopupMethods);
+      await _storeWalletTopupMethods(
+        session,
+        adminId: adminId,
+        methods: updated,
+      );
+      await _audit(
+        session,
+        adminId: adminId,
+        action: 'settings.wallet_topup_methods.update',
+        entityType: 'app_setting',
+        entityId: 'wallet_topup_methods',
+        details: {'items': changed},
+      );
+      return updated.map((method) => method.toMap()).toList(growable: false);
     });
   }
 
@@ -6070,6 +6196,58 @@ class PlatformRepository {
       ''');
   }
 
+  Future<List<_WalletTopupMethod>> _loadWalletTopupMethods(
+    MaestroDbSession session,
+  ) async {
+    final rows = await session.select('''
+      select value
+      from public.app_settings
+      where key = 'wallet_topup_methods'
+      limit 1
+      ''');
+    return _walletTopupMethodsFromRaw(
+      rows.isEmpty ? null : rows.single['value'],
+    );
+  }
+
+  Future<void> _storeWalletTopupMethods(
+    MaestroDbSession session, {
+    required String adminId,
+    required List<_WalletTopupMethod> methods,
+  }) {
+    return session.execute(
+      '''
+      insert into public.app_settings (
+        key,
+        value,
+        is_public,
+        description,
+        updated_by
+      )
+      values (
+        'wallet_topup_methods',
+        cast(@value as jsonb),
+        true,
+        'Wallet top-up methods shown in the customer and craftsman apps.',
+        @adminId
+      )
+      on conflict (key) do update
+      set
+        value = excluded.value,
+        is_public = true,
+        description = excluded.description,
+        updated_by = excluded.updated_by
+      ''',
+      parameters: {
+        'value': _jsonText({
+          'version': 1,
+          'items': methods.map((method) => method.toMap()).toList(),
+        }),
+        'adminId': adminId,
+      },
+    );
+  }
+
   Future<List<Map<String, dynamic>>> _listHomeBanners(
     MaestroDbSession session, {
     bool activeOnly = true,
@@ -6893,6 +7071,254 @@ class PlatformRuleException implements Exception {
 
   @override
   String toString() => 'PlatformRuleException($statusCode): $message';
+}
+
+const Set<String> _walletTopupStatuses = {'open', 'coming_soon', 'closed'};
+
+const List<_WalletTopupMethod> _walletTopupMethodDefaults = [
+  _WalletTopupMethod(
+    id: 'coupon',
+    titleAr: 'كوبون شحن',
+    subtitleAr: 'أدخل رمز كوبون شحن المحفظة',
+    status: 'open',
+    sortOrder: 0,
+    integrated: true,
+    iconKey: 'confirmation_number',
+  ),
+  _WalletTopupMethod(
+    id: 'libyana',
+    titleAr: 'ليبيانا',
+    subtitleAr: 'الشحن عبر ليبيانا',
+    status: 'coming_soon',
+    sortOrder: 10,
+    integrated: false,
+    iconKey: 'libyana',
+  ),
+  _WalletTopupMethod(
+    id: 'sadad',
+    titleAr: 'سداد',
+    subtitleAr: 'الشحن عبر سداد',
+    status: 'coming_soon',
+    sortOrder: 20,
+    integrated: false,
+    iconKey: 'sadad',
+  ),
+  _WalletTopupMethod(
+    id: 'bank_card_online',
+    titleAr: 'البطاقة المصرفية (أونلاين)',
+    subtitleAr: 'الشحن ببطاقة مصرفية',
+    status: 'coming_soon',
+    sortOrder: 30,
+    integrated: false,
+    iconKey: 'bank_card',
+  ),
+  _WalletTopupMethod(
+    id: 'edfa3ly',
+    titleAr: 'ادفعلي',
+    subtitleAr: 'الشحن عبر ادفعلي',
+    status: 'coming_soon',
+    sortOrder: 40,
+    integrated: false,
+    iconKey: 'edfa3ly',
+  ),
+  _WalletTopupMethod(
+    id: 'mobicash',
+    titleAr: 'موبي كاش',
+    subtitleAr: 'الشحن عبر موبي كاش',
+    status: 'coming_soon',
+    sortOrder: 50,
+    integrated: false,
+    iconKey: 'mobicash',
+  ),
+  _WalletTopupMethod(
+    id: 'masrufi_pay',
+    titleAr: 'مصرفي باي',
+    subtitleAr: 'الشحن عبر مصرفي باي',
+    status: 'coming_soon',
+    sortOrder: 60,
+    integrated: false,
+    iconKey: 'masrufi_pay',
+  ),
+  _WalletTopupMethod(
+    id: 'yusr_online',
+    titleAr: 'يسر أونلاين',
+    subtitleAr: 'الشحن عبر يسر أونلاين',
+    status: 'coming_soon',
+    sortOrder: 70,
+    integrated: false,
+    iconKey: 'yusr_online',
+  ),
+  _WalletTopupMethod(
+    id: 'aqsat_online',
+    titleAr: 'أقساط أونلاين (التجاري الوطني)',
+    subtitleAr: 'الشحن عبر أقساط أونلاين',
+    status: 'coming_soon',
+    sortOrder: 80,
+    integrated: false,
+    iconKey: 'aqsat_online',
+  ),
+  _WalletTopupMethod(
+    id: 'tadawul_online',
+    titleAr: 'تداول (Online)',
+    subtitleAr: 'الشحن عبر تداول',
+    status: 'coming_soon',
+    sortOrder: 90,
+    integrated: false,
+    iconKey: 'tadawul_online',
+  ),
+  _WalletTopupMethod(
+    id: 'sahary_pay',
+    titleAr: 'صحاري باي',
+    subtitleAr: 'الشحن عبر صحاري باي',
+    status: 'coming_soon',
+    sortOrder: 100,
+    integrated: false,
+    iconKey: 'sahary_pay',
+  ),
+  _WalletTopupMethod(
+    id: 'smart_pay',
+    titleAr: 'سمارت باي (المتوسط)',
+    subtitleAr: 'الشحن عبر سمارت باي',
+    status: 'coming_soon',
+    sortOrder: 110,
+    integrated: false,
+    iconKey: 'smart_pay',
+  ),
+];
+
+class _WalletTopupMethod {
+  const _WalletTopupMethod({
+    required this.id,
+    required this.titleAr,
+    required this.subtitleAr,
+    required this.status,
+    required this.sortOrder,
+    required this.integrated,
+    this.iconKey,
+  });
+
+  final String id;
+  final String titleAr;
+  final String subtitleAr;
+  final String status;
+  final int sortOrder;
+  final bool integrated;
+  final String? iconKey;
+
+  _WalletTopupMethod copyWith({String? status, int? sortOrder}) {
+    return _WalletTopupMethod(
+      id: id,
+      titleAr: titleAr,
+      subtitleAr: subtitleAr,
+      status: status ?? this.status,
+      sortOrder: sortOrder ?? this.sortOrder,
+      integrated: integrated,
+      iconKey: iconKey,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'title_ar': titleAr,
+      'subtitle_ar': subtitleAr,
+      'status': status,
+      'sort_order': sortOrder,
+      'integrated': integrated,
+      if (iconKey != null) 'icon_key': iconKey,
+    };
+  }
+}
+
+List<_WalletTopupMethod> _walletTopupMethodsFromRaw(Object? raw) {
+  Object? decoded = raw;
+  if (raw is String) {
+    try {
+      decoded = jsonDecode(raw);
+    } on FormatException {
+      decoded = null;
+    }
+  }
+  final source = decoded is List
+      ? decoded
+      : decoded is Map && decoded['items'] is List
+      ? decoded['items'] as List
+      : const [];
+  final stored = <String, Map<String, dynamic>>{};
+  for (final rawItem in source) {
+    if (rawItem is! Map) continue;
+    final item = Map<String, dynamic>.from(rawItem);
+    final id = item['id']?.toString().trim() ?? '';
+    if (id.isNotEmpty) stored[id] = item;
+  }
+
+  final methods = _walletTopupMethodDefaults
+      .map((fallback) {
+        final item = stored[fallback.id];
+        final rawStatus = item?['status']?.toString().trim();
+        var status = _walletTopupStatuses.contains(rawStatus)
+            ? rawStatus!
+            : fallback.status;
+        if (status == 'open' && !fallback.integrated) {
+          status = 'coming_soon';
+        }
+        final rawOrder = item?['sort_order'];
+        final parsedOrder = rawOrder is int
+            ? rawOrder
+            : rawOrder is num && rawOrder == rawOrder.roundToDouble()
+            ? rawOrder.toInt()
+            : int.tryParse(rawOrder?.toString() ?? '');
+        final sortOrder =
+            parsedOrder == null || parsedOrder < -100000 || parsedOrder > 100000
+            ? fallback.sortOrder
+            : parsedOrder;
+        return fallback.copyWith(status: status, sortOrder: sortOrder);
+      })
+      .toList(growable: false);
+  methods.sort(_compareWalletTopupMethods);
+  return methods;
+}
+
+int _compareWalletTopupMethods(_WalletTopupMethod a, _WalletTopupMethod b) {
+  final order = a.sortOrder.compareTo(b.sortOrder);
+  return order != 0 ? order : a.id.compareTo(b.id);
+}
+
+void _validateWalletTopupImmutableFields(
+  Map<String, dynamic> input,
+  _WalletTopupMethod expected,
+) {
+  const allowed = {
+    'id',
+    'title_ar',
+    'subtitle_ar',
+    'status',
+    'sort_order',
+    'integrated',
+    'icon_key',
+  };
+  for (final key in input.keys) {
+    if (!allowed.contains(key)) {
+      throw PlatformRuleException(
+        'الحقل "$key" غير مدعوم في إعدادات طرق الشحن.',
+        statusCode: 422,
+      );
+    }
+  }
+  final expectedFields = <String, Object?>{
+    'title_ar': expected.titleAr,
+    'subtitle_ar': expected.subtitleAr,
+    'integrated': expected.integrated,
+    'icon_key': expected.iconKey,
+  };
+  for (final entry in expectedFields.entries) {
+    if (input.containsKey(entry.key) && input[entry.key] != entry.value) {
+      throw PlatformRuleException(
+        'لا يمكن تغيير الحقل "${entry.key}" لطريقة الشحن "${expected.id}".',
+        statusCode: 422,
+      );
+    }
+  }
 }
 
 class _RequestAutomationSettings {

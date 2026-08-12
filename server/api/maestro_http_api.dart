@@ -427,6 +427,12 @@ class MaestroHttpApi {
         );
         return;
       }
+      if (path == '/wallet/topup-methods' && request.method == 'GET') {
+        await _json(request.response, HttpStatus.ok, {
+          'data': await repository.walletTopupMethods(),
+        });
+        return;
+      }
       if (path == '/wallet/coupons/redeem' && request.method == 'POST') {
         final body = await _readJsonObject(request);
         final code = _requireText(
@@ -1482,6 +1488,25 @@ class MaestroHttpApi {
       await _json(request.response, HttpStatus.ok, {'deleted': true});
       return true;
     }
+    if (path == '/admin/settings/wallet-topup-methods' &&
+        request.method == 'GET') {
+      await _json(request.response, HttpStatus.ok, {
+        'settings': await repository.adminWalletTopupMethods(),
+      });
+      return true;
+    }
+    if (path == '/admin/settings/wallet-topup-methods' &&
+        request.method == 'PUT') {
+      final body = await _readJsonObject(request);
+      final rawItems = body['items'] ?? body['methods'];
+      await _json(request.response, HttpStatus.ok, {
+        'settings': await repository.adminSetWalletTopupMethods(
+          adminId: adminId,
+          items: _walletTopupMethodItems(rawItems),
+        ),
+      });
+      return true;
+    }
     if (path == '/admin/settings/request-automation' &&
         request.method == 'GET') {
       await _json(request.response, HttpStatus.ok, {
@@ -1816,6 +1841,80 @@ List<String> _stringList(Object? value) {
       .where((item) => item.isNotEmpty)
       .toSet()
       .toList();
+}
+
+List<Map<String, dynamic>> _walletTopupMethodItems(Object? value) {
+  if (value is! List || value.isEmpty) {
+    throw const PlatformRuleException(
+      'أرسل قائمة items وبداخلها طريقة شحن واحدة على الأقل.',
+      statusCode: 422,
+    );
+  }
+  if (value.length > 100) {
+    throw const PlatformRuleException(
+      'عدد طرق الشحن أكبر من الحد المسموح.',
+      statusCode: 422,
+    );
+  }
+  const statuses = {'open', 'coming_soon', 'closed'};
+  final result = <Map<String, dynamic>>[];
+  for (final rawItem in value) {
+    if (rawItem is! Map) {
+      throw const PlatformRuleException(
+        'بيانات طريقة الشحن غير صالحة.',
+        statusCode: 422,
+      );
+    }
+    final item = Map<String, dynamic>.from(rawItem);
+    _requireText(item, 'id', 'معرف طريقة الشحن مطلوب.');
+    if (!item.containsKey('status') && !item.containsKey('sort_order')) {
+      throw const PlatformRuleException(
+        'حدد status أو sort_order لطريقة الشحن.',
+        statusCode: 422,
+      );
+    }
+    if (item.containsKey('status')) {
+      final status = item['status']?.toString().trim() ?? '';
+      if (!statuses.contains(status)) {
+        throw const PlatformRuleException(
+          'حالة طريقة الشحن يجب أن تكون open أو coming_soon أو closed.',
+          statusCode: 422,
+        );
+      }
+      item['status'] = status;
+    }
+    if (item.containsKey('sort_order')) {
+      final rawOrder = item['sort_order'];
+      final parsed = rawOrder is int
+          ? rawOrder
+          : rawOrder is num && rawOrder == rawOrder.roundToDouble()
+          ? rawOrder.toInt()
+          : int.tryParse(rawOrder?.toString() ?? '');
+      if (parsed == null || parsed < -100000 || parsed > 100000) {
+        throw const PlatformRuleException(
+          'ترتيب طريقة الشحن غير صالح.',
+          statusCode: 422,
+        );
+      }
+      item['sort_order'] = parsed;
+    }
+    for (final key in const ['title_ar', 'subtitle_ar', 'icon_key']) {
+      if (item.containsKey(key) && item[key] is! String) {
+        throw PlatformRuleException(
+          'الحقل "$key" في طريقة الشحن غير صالح.',
+          statusCode: 422,
+        );
+      }
+    }
+    if (item.containsKey('integrated') && item['integrated'] is! bool) {
+      throw const PlatformRuleException(
+        'قيمة integrated في طريقة الشحن غير صالحة.',
+        statusCode: 422,
+      );
+    }
+    result.add(item);
+  }
+  return result;
 }
 
 void _validateAddress(Map<String, dynamic> body) {
