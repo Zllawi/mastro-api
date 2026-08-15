@@ -211,43 +211,63 @@ class MaestroHttpApi {
         await _createRequest(request, profileId);
         return;
       }
+      final redispatchRequestId = _pathBetween(
+        path,
+        '/requests/',
+        '/redispatch',
+      );
+      if (redispatchRequestId != null && request.method == 'POST') {
+        _requireRole(role, 'customer');
+        final result = await repository.redispatchRequest(
+          customerId: profileId,
+          requestId: redispatchRequestId,
+        );
+        unawaited(_dispatchDueCampaignsAndPushSafely());
+        await _json(request.response, HttpStatus.ok, result);
+        return;
+      }
+      final cancelCustomerRequestId = _pathBetween(
+        path,
+        '/requests/',
+        '/cancel',
+      );
+      if (cancelCustomerRequestId != null && request.method == 'POST') {
+        _requireRole(role, 'customer');
+        final body = await _readJsonObject(request);
+        final reason = body['reason']?.toString().trim();
+        if (reason != null && reason.length > 500) {
+          throw const PlatformRuleException(
+            'سبب الإلغاء أطول من الحد المسموح.',
+            statusCode: 422,
+          );
+        }
+        final result = await repository.cancelRequestByCustomer(
+          customerId: profileId,
+          requestId: cancelCustomerRequestId,
+          reason: reason,
+        );
+        unawaited(_dispatchDueCampaignsAndPushSafely());
+        await _json(request.response, HttpStatus.ok, {
+          'cancelled': true,
+          ...result,
+        });
+        return;
+      }
       if (path == '/offers' && request.method == 'POST') {
         _requireRole(role, 'craftsman');
         final body = await _readJsonObject(request);
         _requireText(body, 'request_id', 'معرف الطلب مطلوب.');
-        _requirePositiveNumber(
-          body,
-          'total_amount',
-          'قيمة العرض يجب أن تكون أكبر من صفر.',
+        _validateOfferAmounts(body);
+        final offer = await repository.submitOffer(
+          craftsmanId: profileId,
+          input: body,
         );
-        final labor = _nonNegativeNumber(
-          body['labor_amount'],
-          'تكلفة العمل غير صالحة.',
-        );
-        final materials = _nonNegativeNumber(
-          body['materials_amount'],
-          'تكلفة المواد غير صالحة.',
-        );
-        final inspection = _nonNegativeNumber(
-          body['inspection_fee'],
-          'قيمة الكشف غير صالحة.',
-        );
-        final total = body['total_amount'] as num;
-        if ((labor + materials + inspection - total).abs() > 0.001) {
-          throw const PlatformRuleException(
-            'إجمالي العرض لا يطابق تفاصيل تكلفة العمل والمواد والكشف.',
-            statusCode: 422,
-          );
-        }
-        body
-          ..['labor_amount'] = labor
-          ..['materials_amount'] = materials
-          ..['inspection_fee'] = inspection;
+        unawaited(_dispatchDueCampaignsAndPushSafely());
         await _json(request.response, HttpStatus.created, {
-          'offer': await repository.submitOffer(
-            craftsmanId: profileId,
-            input: body,
-          ),
+          'offer': offer,
+          'request_status': 'offers_received',
+          'my_offer_status': 'submitted',
+          'offer_sent': true,
         });
         return;
       }
@@ -267,12 +287,14 @@ class MaestroHttpApi {
         _requireRole(role, 'customer');
         final body = await _readJsonObject(request);
         _validateOfferAmounts(body);
+        final revision = await repository.requestOfferRevision(
+          customerId: profileId,
+          offerId: reviseOfferId,
+          input: body,
+        );
+        unawaited(_dispatchDueCampaignsAndPushSafely());
         await _json(request.response, HttpStatus.created, {
-          'revision': await repository.requestOfferRevision(
-            customerId: profileId,
-            offerId: reviseOfferId,
-            input: body,
-          ),
+          'revision': revision,
         });
         return;
       }
@@ -290,14 +312,14 @@ class MaestroHttpApi {
             statusCode: 422,
           );
         }
-        await _json(request.response, HttpStatus.ok, {
-          'revision': await repository.respondOfferRevision(
-            craftsmanId: profileId,
-            revisionId: revisionResponseId,
-            approved: body['approved'] == true,
-            responseNote: body['response_note']?.toString(),
-          ),
-        });
+        final revision = await repository.respondOfferRevision(
+          craftsmanId: profileId,
+          revisionId: revisionResponseId,
+          approved: body['approved'] == true,
+          responseNote: body['response_note']?.toString(),
+        );
+        unawaited(_dispatchDueCampaignsAndPushSafely());
+        await _json(request.response, HttpStatus.ok, {'revision': revision});
         return;
       }
       final acceptRequestId = _pathBetween(path, '/requests/', '/accept-offer');
@@ -310,6 +332,7 @@ class MaestroHttpApi {
           requestId: acceptRequestId,
           offerId: offerId,
         );
+        unawaited(_dispatchDueCampaignsAndPushSafely());
         await _json(request.response, HttpStatus.ok, {'accepted': true});
         return;
       }
@@ -323,6 +346,7 @@ class MaestroHttpApi {
           nextStatus: _requireText(body, 'status', 'حالة الطلب مطلوبة.'),
           cashReceivedConfirmed: body['cash_received_confirmed'] == true,
         );
+        unawaited(_dispatchDueCampaignsAndPushSafely());
         await _json(request.response, HttpStatus.ok, {'updated': true});
         return;
       }
@@ -603,6 +627,13 @@ class MaestroHttpApi {
 
       await _json(request.response, HttpStatus.notFound, {
         'message': 'المسار غير موجود.',
+      });
+    } on RequestRedispatchCooldownException catch (error) {
+      final remaining = error.retryAt.difference(DateTime.now().toUtc());
+      await _safeJson(request.response, HttpStatus.tooManyRequests, {
+        'message': error.message,
+        'retry_at': error.retryAt.toUtc().toIso8601String(),
+        'retry_after_seconds': remaining.inSeconds.clamp(1, 60 * 60),
       });
     } on PlatformRuleException catch (error) {
       await _safeJson(request.response, error.statusCode, {
@@ -1056,7 +1087,7 @@ class MaestroHttpApi {
       customerId: profileId,
       input: body,
     );
-    await _dispatchDueCampaignsAndPush();
+    unawaited(_dispatchDueCampaignsAndPushSafely());
     await _json(request.response, HttpStatus.created, {'request': created});
   }
 
@@ -1541,7 +1572,7 @@ class MaestroHttpApi {
           intervalMinutes: _queryInt(
             body['batch_interval_minutes']?.toString(),
             fallback: 60,
-            minimum: 15,
+            minimum: 60,
             maximum: 24 * 60,
           ),
         ),
@@ -1619,6 +1650,19 @@ class MaestroHttpApi {
     final delivered = await repository.dispatchDueCampaigns();
     await pushDispatcher?.dispatchPending();
     return delivered;
+  }
+
+  Future<void> _dispatchDueCampaignsAndPushSafely() async {
+    try {
+      await _dispatchDueCampaignsAndPush();
+    } catch (_) {
+      // The database operation has already committed. Let the periodic
+      // dispatcher retry instead of returning a misleading 5xx that could
+      // make the client repeat a non-idempotent POST.
+      stderr.writeln(
+        'Immediate notification dispatch was deferred to the scheduler.',
+      );
+    }
   }
 }
 
@@ -1765,12 +1809,8 @@ void _requirePositiveNumber(
   String key,
   String message,
 ) {
-  final value = input[key];
-  final number = value is num ? value : num.tryParse(value?.toString() ?? '');
-  if (number == null || number <= 0) {
-    throw PlatformRuleException(message, statusCode: 422);
-  }
-  input[key] = number;
+  final cents = _moneyCents(input[key], message, mustBePositive: true);
+  input[key] = _moneyFromCents(cents);
 }
 
 int _nonNegativeInt(Object? value, String message) {
@@ -1803,13 +1843,31 @@ int _queryInt(
   return parsed.clamp(minimum, maximum);
 }
 
-num _nonNegativeNumber(Object? value, String message) {
-  final parsed = value is num ? value : num.tryParse(value?.toString() ?? '');
-  if (parsed == null || parsed < 0) {
+const int _maxMoneyCents = 999999999999;
+
+int _moneyCents(Object? value, String message, {bool mustBePositive = false}) {
+  final raw = value?.toString().trim() ?? '';
+  if (raw.length > 32) {
     throw PlatformRuleException(message, statusCode: 422);
   }
-  return parsed;
+  final match = RegExp(r'^(\d+)(?:\.(\d{1,2}))?$').firstMatch(raw);
+  if (match == null) {
+    throw PlatformRuleException(message, statusCode: 422);
+  }
+  final whole = int.tryParse(match.group(1)!);
+  final fractionText = (match.group(2) ?? '').padRight(2, '0');
+  final fraction = fractionText.isEmpty ? 0 : int.tryParse(fractionText);
+  if (whole == null || fraction == null) {
+    throw PlatformRuleException(message, statusCode: 422);
+  }
+  final cents = whole * 100 + fraction;
+  if (cents < (mustBePositive ? 1 : 0) || cents > _maxMoneyCents) {
+    throw PlatformRuleException(message, statusCode: 422);
+  }
+  return cents;
 }
+
+num _moneyFromCents(int cents) => cents / 100;
 
 num _coordinate(
   Object? value, {
@@ -1992,34 +2050,34 @@ void _validateNotificationCampaign(Map<String, dynamic> body) {
 }
 
 void _validateOfferAmounts(Map<String, dynamic> body) {
-  _requirePositiveNumber(
-    body,
-    'total_amount',
-    'Offer total must be greater than zero.',
+  final totalCents = _moneyCents(
+    body['total_amount'],
+    'إجمالي العرض غير صالح. استخدم رقمًا موجبًا بحد أقصى منزلتين عشريتين.',
+    mustBePositive: true,
   );
-  final labor = _nonNegativeNumber(
+  final laborCents = _moneyCents(
     body['labor_amount'],
-    'Labor amount is invalid.',
+    'تكلفة العمل غير صالحة. استخدم بحد أقصى منزلتين عشريتين.',
   );
-  final materials = _nonNegativeNumber(
+  final materialsCents = _moneyCents(
     body['materials_amount'],
-    'Materials amount is invalid.',
+    'تكلفة المواد غير صالحة. استخدم بحد أقصى منزلتين عشريتين.',
   );
-  final inspection = _nonNegativeNumber(
+  final inspectionCents = _moneyCents(
     body['inspection_fee'],
-    'Inspection fee is invalid.',
+    'قيمة الكشف غير صالحة. استخدم بحد أقصى منزلتين عشريتين.',
   );
-  final total = body['total_amount'] as num;
-  if ((labor + materials + inspection - total).abs() > 0.001) {
+  if (laborCents + materialsCents + inspectionCents != totalCents) {
     throw const PlatformRuleException(
-      'Offer total must equal labor + materials + inspection.',
+      'إجمالي العرض لا يطابق تكلفة العمل والمواد والكشف.',
       statusCode: 422,
     );
   }
   body
-    ..['labor_amount'] = labor
-    ..['materials_amount'] = materials
-    ..['inspection_fee'] = inspection;
+    ..['total_amount'] = _moneyFromCents(totalCents)
+    ..['labor_amount'] = _moneyFromCents(laborCents)
+    ..['materials_amount'] = _moneyFromCents(materialsCents)
+    ..['inspection_fee'] = _moneyFromCents(inspectionCents);
 }
 
 void _validateHomeBanner(Map<String, dynamic> body) {

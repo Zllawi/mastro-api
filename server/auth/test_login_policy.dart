@@ -8,6 +8,8 @@ class TestLoginPolicy {
     final appEnvironment = (environment['APP_ENV'] ?? 'development')
         .trim()
         .toLowerCase();
+    final hostedOnRender =
+        (environment['RENDER'] ?? '').trim().toLowerCase() == 'true';
     final phonesByRole = <String, String>{};
 
     void addPhone(String role, String environmentKey) {
@@ -23,7 +25,9 @@ class TestLoginPolicy {
 
     return TestLoginPolicy._(
       environmentAllowsTestLogin:
-          appEnvironment != 'production' && appEnvironment != 'prod',
+          !hostedOnRender &&
+          appEnvironment != 'production' &&
+          appEnvironment != 'prod',
       phonesByRole: phonesByRole,
     );
   }

@@ -32,7 +32,9 @@ class ResalaConfig {
     final baseUrl = env[baseUrlEnvName];
     final appEnv = (env[environmentEnvName] ?? env['DART_ENV'] ?? 'development')
         .toLowerCase();
-    final production = appEnv == 'production' || appEnv == 'prod';
+    final hostedOnRender = (env['RENDER'] ?? '').trim().toLowerCase() == 'true';
+    final production =
+        hostedOnRender || appEnv == 'production' || appEnv == 'prod';
 
     return ResalaConfig(
       token: token,

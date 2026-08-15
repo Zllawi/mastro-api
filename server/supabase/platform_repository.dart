@@ -475,6 +475,10 @@ class PlatformRepository {
     return db.run((session) async {
       final profileRows = await session.select(
         '''
+        with expiry_sweep as (
+          select maestro_private.expire_stale_service_requests()
+            as expired_count
+        )
         select
           jsonb_build_object(
             'id', p.id,
@@ -588,6 +592,7 @@ class PlatformRepository {
             where n.profile_id = p.id and n.read_at is null
           ) as unread_notifications
         from public.profiles p
+        cross join expiry_sweep
         where p.id = @profileId
         limit 1
         ''',
@@ -1154,8 +1159,13 @@ class PlatformRepository {
       }
       final categoryRows = await session.select(
         '''
+        with expiry_sweep as (
+          select maestro_private.expire_stale_service_requests()
+            as expired_count
+        )
         select id, availability_status
         from public.service_categories
+        cross join expiry_sweep
         where id = @categoryId
           and is_active = true
         limit 1
@@ -1178,6 +1188,11 @@ class PlatformRepository {
           statusCode: 409,
         );
       }
+      await _lockAndAssertNoDuplicateActiveRequest(
+        session,
+        customerId: customerId,
+        categoryId: input['category_id'].toString(),
+      );
       final addressRows = await session.select(
         '''
         select *
@@ -1374,7 +1389,9 @@ class PlatformRepository {
           @notificationBody:text,
           jsonb_build_object(
             'request_id', @requestId:uuid,
-            'notification_type', 'order'
+            'notification_type', 'order',
+            'dispatch_notification', true,
+            'actionable', true
           )
         from public.craftsman_services cs
         join public.request_dispatches rd
@@ -1404,6 +1421,302 @@ class PlatformRepository {
     return db.run((session) => _requestsForProfile(session, profileId));
   }
 
+  Future<Map<String, dynamic>> cancelRequestByCustomer({
+    required String customerId,
+    required String requestId,
+    String? reason,
+  }) {
+    return db.runTx((session) async {
+      await _expireStaleRequests(session);
+      final requests = await session.select(
+        '''
+        select id, customer_id, status, accepted_offer_id
+        from public.service_requests
+        where id = @requestId
+          and customer_id = @customerId
+        limit 1
+        for update
+        ''',
+        parameters: {'requestId': requestId, 'customerId': customerId},
+      );
+      if (requests.isEmpty) {
+        throw const PlatformRuleException('الطلب غير موجود.', statusCode: 404);
+      }
+      final request = requests.single;
+      if (!{
+            'submitted',
+            'offers_received',
+          }.contains(request['status']?.toString()) ||
+          request['accepted_offer_id'] != null) {
+        throw const PlatformRuleException(
+          'لا يمكن إلغاء الطلب بعد قبول عرض أو بدء العمل.',
+          statusCode: 409,
+        );
+      }
+      final cancellationReason = reason?.trim().isNotEmpty == true
+          ? reason!.trim()
+          : 'ألغى العميل الطلب.';
+      final updated = await session.select(
+        '''
+        update public.service_requests
+        set
+          status = 'cancelled',
+          cancellation_mode = 'no_entitlement',
+          cancellation_reason = @reason,
+          cancelled_by = @customerId,
+          cancelled_at = now(),
+          inspection_due_amount = 0,
+          updated_at = now()
+        where id = @requestId
+        returning
+          id as request_id,
+          status,
+          cancellation_mode,
+          cancellation_reason,
+          cancelled_at
+        ''',
+        parameters: {
+          'requestId': requestId,
+          'customerId': customerId,
+          'reason': cancellationReason,
+        },
+      );
+      await session.execute(
+        '''
+        update public.offers
+        set status = 'withdrawn', updated_at = now()
+        where request_id = @requestId
+          and status = 'submitted'
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      await session.execute(
+        '''
+        with cancelled_revisions as (
+          update public.offer_revision_requests
+          set
+            status = 'cancelled',
+            response_note = coalesce(response_note, 'أُلغي الطلب من العميل.'),
+            responded_at = coalesce(responded_at, now())
+          where request_id = @requestId
+            and status = 'pending'
+          returning id
+        )
+        update public.notifications notification
+        set
+          read_at = coalesce(notification.read_at, now()),
+          data = notification.data || jsonb_build_object(
+            'revision_status', 'cancelled',
+            'actionable', false
+          ),
+          push_status = case
+            when notification.push_status in ('pending', 'failed')
+              then 'skipped'
+            else notification.push_status
+          end,
+          push_error = case
+            when notification.push_status in ('pending', 'failed')
+              then 'Offer revision is no longer actionable.'
+            else notification.push_error
+          end
+        from cancelled_revisions revision
+        where notification.data ->> 'revision_id' = revision.id::text
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      await session.execute(
+        '''
+        update public.request_dispatches
+        set expires_at = least(expires_at, now())
+        where request_id = @requestId
+          and expires_at > now()
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      await _closeRequestDispatchNotifications(
+        session,
+        requestId: requestId,
+        status: 'cancelled',
+      );
+      await _closeOfferNotifications(
+        session,
+        requestId: requestId,
+        status: 'cancelled',
+      );
+      await session.execute(
+        '''
+        insert into public.request_status_events (
+          request_id,
+          status,
+          actor_id,
+          note
+        )
+        values (@requestId, 'cancelled', @customerId, @reason)
+        ''',
+        parameters: {
+          'requestId': requestId,
+          'customerId': customerId,
+          'reason': cancellationReason,
+        },
+      );
+      await session.execute(
+        '''
+        insert into public.notifications (profile_id, title, body, data)
+        select distinct
+          recipients.craftsman_id,
+          'تم إلغاء الطلب',
+          'ألغى العميل الطلب قبل قبول أي عرض.',
+          jsonb_build_object(
+            'request_id', @requestId:uuid,
+            'notification_type', 'order',
+            'status', 'cancelled'
+          )
+        from (
+          select offer.craftsman_id
+          from public.offers offer
+          where offer.request_id = @requestId
+          union
+          select dispatch.craftsman_id
+          from public.request_dispatches dispatch
+          where dispatch.request_id = @requestId
+        ) recipients
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      return updated.single;
+    });
+  }
+
+  Future<Map<String, dynamic>> redispatchRequest({
+    required String customerId,
+    required String requestId,
+  }) {
+    return db.runTx((session) async {
+      await _expireStaleRequests(session);
+      await session.select(
+        '''
+        select pg_advisory_xact_lock(
+          hashtextextended(cast(@requestId as text), 904029)
+        )
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      final rows = await session.select(
+        '''
+        select
+          sr.*,
+          coalesce(dispatch_summary.last_notified_at, sr.created_at)
+            as last_distribution_at
+        from public.service_requests sr
+        left join lateral (
+          select max(rd.notified_at) as last_notified_at
+          from public.request_dispatches rd
+          where rd.request_id = sr.id
+        ) dispatch_summary on true
+        where sr.id = @requestId
+          and sr.customer_id = @customerId
+        limit 1
+        for update of sr
+        ''',
+        parameters: {'requestId': requestId, 'customerId': customerId},
+      );
+      if (rows.isEmpty) {
+        throw const PlatformRuleException('الطلب غير موجود.', statusCode: 404);
+      }
+      final request = rows.single;
+      if (!{
+            'submitted',
+            'offers_received',
+          }.contains(request['status']?.toString()) ||
+          request['accepted_offer_id'] != null ||
+          !(_dateOrNull(
+                request['expires_at'],
+              )?.isAfter(DateTime.now().toUtc()) ??
+              false)) {
+        throw const PlatformRuleException(
+          'لا يمكن إعادة إرسال طلب منتهٍ أو بعد قبول عرض.',
+          statusCode: 409,
+        );
+      }
+      final lastDistributionAt =
+          [
+            _dateOrNull(request['created_at']),
+            _dateOrNull(request['last_distribution_at']),
+            _dateOrNull(request['last_redispatched_at']),
+          ].whereType<DateTime>().reduce(
+            (latest, item) => item.isAfter(latest) ? item : latest,
+          );
+      final now = DateTime.now().toUtc();
+      final retryAt = lastDistributionAt.toUtc().add(const Duration(hours: 1));
+      if (now.isBefore(retryAt)) {
+        throw RequestRedispatchCooldownException(retryAt);
+      }
+
+      final settings = await _requestAutomationSettings(session);
+      var dispatched = 0;
+      if (settings.enabled) {
+        dispatched = await _createRequestDispatchRows(
+          session,
+          requestId: requestId,
+          categoryId: request['category_id'].toString(),
+          batchSize: settings.batchSize,
+          intervalMinutes: settings.intervalMinutes,
+          onlyIfDue: true,
+        );
+        if (dispatched > 0) {
+          await _notifyCurrentRequestDispatchBatch(
+            session,
+            requestId: requestId,
+            urgent: request['urgency'] == true,
+            redispatched: true,
+          );
+        } else {
+          dispatched = await _renotifyLatestUnansweredDispatchBatch(
+            session,
+            requestId: requestId,
+            urgent: request['urgency'] == true,
+            intervalMinutes: settings.intervalMinutes,
+          );
+        }
+      } else {
+        dispatched = await _notifyAdminsAboutManualRequest(
+          session,
+          requestId: requestId,
+          publicCode: request['public_code']?.toString() ?? '',
+          redispatched: true,
+        );
+      }
+      if (dispatched <= 0) {
+        throw const PlatformRuleException(
+          'لا يوجد مستلمون جدد لإعادة إرسال الطلب إليهم حاليًا.',
+          statusCode: 409,
+        );
+      }
+      final updated = await session.select(
+        '''
+        update public.service_requests
+        set
+          last_redispatched_at = now(),
+          redispatch_count = redispatch_count + 1,
+          updated_at = now()
+        where id = @requestId
+        returning last_redispatched_at, expires_at
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      final lastRedispatchedAt = _dateOrNull(
+        updated.single['last_redispatched_at'],
+      )!;
+      return {
+        'redispatched': true,
+        'dispatched_count': dispatched,
+        'last_redispatched_at': lastRedispatchedAt,
+        'next_redispatch_at': lastRedispatchedAt.add(const Duration(hours: 1)),
+        'expires_at': updated.single['expires_at'],
+      };
+    });
+  }
+
   Future<int> dispatchDueRequestBatches() {
     return db.runTx(_dispatchDueRequestBatches);
   }
@@ -1413,6 +1726,40 @@ class PlatformRepository {
     required Map<String, dynamic> input,
   }) {
     return db.runTx((session) async {
+      await _expireStaleRequests(session);
+      await session.select(
+        '''
+        select pg_advisory_xact_lock(
+          hashtextextended(
+            cast(@requestId as text) || ':' || cast(@craftsmanId as text),
+            904028
+          )
+        )
+        ''',
+        parameters: {
+          'requestId': input['request_id'],
+          'craftsmanId': craftsmanId,
+        },
+      );
+      final previousOffers = await session.select(
+        '''
+        select id
+        from public.offers
+        where request_id = @requestId
+          and craftsman_id = @craftsmanId
+        limit 1
+        ''',
+        parameters: {
+          'requestId': input['request_id'],
+          'craftsmanId': craftsmanId,
+        },
+      );
+      if (previousOffers.isNotEmpty) {
+        throw const PlatformRuleException(
+          'لقد أرسلت عرضًا لهذا الطلب بالفعل، ولا يمكن إرسال عرض ثانٍ.',
+          statusCode: 409,
+        );
+      }
       final eligible = await session.select(
         '''
         select sr.id
@@ -1423,6 +1770,8 @@ class PlatformRepository {
         join public.craftsman_profiles cp on cp.profile_id = @craftsmanId
         where sr.id = @requestId
           and sr.status in ('submitted', 'offers_received')
+          and sr.accepted_offer_id is null
+          and sr.expires_at > now()
           and cp.is_verified = true
           and exists (
             select 1
@@ -1440,6 +1789,7 @@ class PlatformRepository {
               )
           )
         limit 1
+        for update of sr
         ''',
         parameters: {
           'craftsmanId': craftsmanId,
@@ -1478,17 +1828,6 @@ class PlatformRepository {
           @warrantyText,
           @note
         )
-        on conflict (request_id, craftsman_id) do update
-        set
-          total_amount = excluded.total_amount,
-          labor_amount = excluded.labor_amount,
-          materials_amount = excluded.materials_amount,
-          inspection_fee = excluded.inspection_fee,
-          arrival_window = excluded.arrival_window,
-          estimated_duration = excluded.estimated_duration,
-          warranty_text = excluded.warranty_text,
-          note = excluded.note,
-          status = 'submitted'
         returning *
         ''',
         parameters: {
@@ -1516,14 +1855,29 @@ class PlatformRepository {
           'craftsmanId': craftsmanId,
         },
       );
-      await session.execute(
+      await _closeRequestDispatchNotifications(
+        session,
+        requestId: input['request_id'].toString(),
+        status: 'offer_sent',
+        craftsmanId: craftsmanId,
+      );
+      final transitionedRequests = await session.execute(
         '''
         update public.service_requests
         set status = 'offers_received'
-        where id = @requestId and status = 'submitted'
+        where id = @requestId
+          and status in ('submitted', 'offers_received')
+          and accepted_offer_id is null
+          and expires_at > now()
         ''',
         parameters: {'requestId': input['request_id']},
       );
+      if (transitionedRequests != 1) {
+        throw const PlatformRuleException(
+          'تغيرت حالة الطلب قبل إرسال العرض. حدّث الطلب وحاول مرة أخرى.',
+          statusCode: 409,
+        );
+      }
       await session.execute(
         '''
         insert into public.request_status_events (request_id, status, actor_id, note)
@@ -1573,8 +1927,9 @@ class PlatformRepository {
     required String customerId,
     required String requestId,
   }) {
-    return db.run(
-      (session) => session.select(
+    return db.runTx((session) async {
+      await _expireStaleRequests(session);
+      return session.select(
         '''
         select
           o.*,
@@ -1585,6 +1940,16 @@ class PlatformRepository {
           cp.completed_jobs,
           cp.on_time_percent,
           cp.is_verified,
+          latest_revision.id as revision_id,
+          latest_revision.status as revision_status,
+          latest_revision.total_amount as revision_total_amount,
+          latest_revision.labor_amount as revision_labor_amount,
+          latest_revision.materials_amount as revision_materials_amount,
+          latest_revision.inspection_fee as revision_inspection_fee,
+          latest_revision.note as revision_note,
+          latest_revision.response_note as revision_response_note,
+          latest_revision.created_at as revision_created_at,
+          latest_revision.responded_at as revision_responded_at,
           public.maestro_distance_km(
             sr.latitude,
             sr.longitude,
@@ -1595,14 +1960,21 @@ class PlatformRepository {
         join public.service_requests sr on sr.id = o.request_id
         join public.profiles p on p.id = o.craftsman_id
         join public.craftsman_profiles cp on cp.profile_id = o.craftsman_id
+        left join lateral (
+          select revision.*
+          from public.offer_revision_requests revision
+          where revision.offer_id = o.id
+          order by revision.created_at desc, revision.id desc
+          limit 1
+        ) latest_revision on true
         where o.request_id = @requestId
           and sr.customer_id = @customerId
           and o.status in ('submitted', 'accepted')
         order by o.total_amount, o.created_at
         ''',
         parameters: {'requestId': requestId, 'customerId': customerId},
-      ),
-    );
+      );
+    });
   }
 
   Future<Map<String, dynamic>> requestOfferRevision({
@@ -1611,28 +1983,56 @@ class PlatformRepository {
     required Map<String, dynamic> input,
   }) {
     return db.runTx((session) async {
-      final offerRows = await session.select(
+      await _expireStaleRequests(session);
+      final offerIdentityRows = await session.select(
         '''
-        select o.*, sr.customer_id, sr.status as request_status, sr.accepted_offer_id
-        from public.offers o
-        join public.service_requests sr on sr.id = o.request_id
-        where o.id = @offerId
-          and sr.customer_id = @customerId
-          and (
-            (
-              sr.status in ('submitted', 'offers_received')
-              and o.status = 'submitted'
-            )
-            or (
-              sr.status = 'accepted'
-              and sr.accepted_offer_id = o.id
-              and o.status = 'accepted'
-            )
-          )
+        select offer.request_id
+        from public.offers offer
+        join public.service_requests request on request.id = offer.request_id
+        where offer.id = @offerId
+          and request.customer_id = @customerId
         limit 1
-        for update of o
         ''',
         parameters: {'offerId': offerId, 'customerId': customerId},
+      );
+      if (offerIdentityRows.isEmpty) {
+        throw const PlatformRuleException(
+          'لا يمكن تعديل هذا العرض الآن. قد يكون الطلب مقبولًا أو العرض لم يعد متاحًا.',
+          statusCode: 409,
+        );
+      }
+      final requestId = offerIdentityRows.single['request_id'];
+      final requestRows = await session.select(
+        '''
+        select id
+        from public.service_requests
+        where id = @requestId
+          and customer_id = @customerId
+          and status in ('submitted', 'offers_received')
+          and accepted_offer_id is null
+          and expires_at > now()
+        limit 1
+        for update
+        ''',
+        parameters: {'requestId': requestId, 'customerId': customerId},
+      );
+      if (requestRows.isEmpty) {
+        throw const PlatformRuleException(
+          'لا يمكن تعديل هذا العرض الآن. قد يكون الطلب مقبولًا أو العرض لم يعد متاحًا.',
+          statusCode: 409,
+        );
+      }
+      final offerRows = await session.select(
+        '''
+        select offer.*
+        from public.offers offer
+        where offer.id = @offerId
+          and offer.request_id = @requestId
+          and offer.status = 'submitted'
+        limit 1
+        for update
+        ''',
+        parameters: {'offerId': offerId, 'requestId': requestId},
       );
       if (offerRows.isEmpty) {
         throw const PlatformRuleException(
@@ -1643,10 +2043,38 @@ class PlatformRepository {
       final offer = offerRows.single;
       await session.execute(
         '''
-        update public.offer_revision_requests
-        set status = 'cancelled'
-        where offer_id = @offerId
-          and status = 'pending'
+        with cancelled_revisions as (
+          update public.offer_revision_requests
+          set
+            status = 'cancelled',
+            response_note = coalesce(
+              response_note,
+              'أُلغي بعد إنشاء طلب تعديل أحدث.'
+            ),
+            responded_at = coalesce(responded_at, now())
+          where offer_id = @offerId
+            and status = 'pending'
+          returning id
+        )
+        update public.notifications notification
+        set
+          read_at = coalesce(notification.read_at, now()),
+          data = notification.data || jsonb_build_object(
+            'revision_status', 'cancelled',
+            'actionable', false
+          ),
+          push_status = case
+            when notification.push_status in ('pending', 'failed')
+              then 'skipped'
+            else notification.push_status
+          end,
+          push_error = case
+            when notification.push_status in ('pending', 'failed')
+              then 'Offer revision is no longer actionable.'
+            else notification.push_error
+          end
+        from cancelled_revisions revision
+        where notification.data ->> 'revision_id' = revision.id::text
         ''',
         parameters: {'offerId': offerId},
       );
@@ -1700,6 +2128,8 @@ class PlatformRepository {
             'offer_id', @offerId:uuid,
             'revision_id', @revisionId:uuid,
             'notification_type', 'offer_revision',
+            'revision_status', 'pending',
+            'actionable', true,
             'total_amount', @totalAmount,
             'labor_amount', @laborAmount,
             'materials_amount', @materialsAmount,
@@ -1729,17 +2159,82 @@ class PlatformRepository {
     String? responseNote,
   }) {
     return db.runTx((session) async {
-      final revisionRows = await session.select(
+      await _expireStaleRequests(session);
+      final revisionOfferRows = await session.select(
         '''
-        select *
+        select request_id, offer_id
         from public.offer_revision_requests
         where id = @revisionId
           and craftsman_id = @craftsmanId
-          and status = 'pending'
+        limit 1
+        ''',
+        parameters: {'revisionId': revisionId, 'craftsmanId': craftsmanId},
+      );
+      if (revisionOfferRows.isEmpty) {
+        throw const PlatformRuleException(
+          'طلب تعديل العرض غير متاح أو تمت معالجته بالفعل.',
+          statusCode: 409,
+        );
+      }
+      final revisionIdentity = revisionOfferRows.single;
+      final requestRows = await session.select(
+        '''
+        select id
+        from public.service_requests
+        where id = @requestId
+          and status in ('submitted', 'offers_received')
+          and accepted_offer_id is null
+          and expires_at > now()
         limit 1
         for update
         ''',
-        parameters: {'revisionId': revisionId, 'craftsmanId': craftsmanId},
+        parameters: {'requestId': revisionIdentity['request_id']},
+      );
+      if (requestRows.isEmpty) {
+        throw const PlatformRuleException(
+          'طلب تعديل العرض غير متاح أو تمت معالجته بالفعل.',
+          statusCode: 409,
+        );
+      }
+      final offerRows = await session.select(
+        '''
+        select id
+        from public.offers
+        where id = @offerId
+          and request_id = @requestId
+          and status = 'submitted'
+        limit 1
+        for update
+        ''',
+        parameters: {
+          'offerId': revisionIdentity['offer_id'],
+          'requestId': revisionIdentity['request_id'],
+        },
+      );
+      if (offerRows.isEmpty) {
+        throw const PlatformRuleException(
+          'طلب تعديل العرض غير متاح أو تمت معالجته بالفعل.',
+          statusCode: 409,
+        );
+      }
+      final revisionRows = await session.select(
+        '''
+        select revision.*
+        from public.offer_revision_requests revision
+        where revision.id = @revisionId
+          and revision.craftsman_id = @craftsmanId
+          and revision.request_id = @requestId
+          and revision.offer_id = @offerId
+          and revision.status = 'pending'
+        limit 1
+        for update
+        ''',
+        parameters: {
+          'revisionId': revisionId,
+          'craftsmanId': craftsmanId,
+          'requestId': revisionIdentity['request_id'],
+          'offerId': revisionIdentity['offer_id'],
+        },
       );
       if (revisionRows.isEmpty) {
         throw const PlatformRuleException(
@@ -1765,7 +2260,7 @@ class PlatformRepository {
         },
       );
       if (approved) {
-        await session.execute(
+        final changedOffers = await session.execute(
           '''
           update public.offers
           set
@@ -1774,12 +2269,9 @@ class PlatformRepository {
             materials_amount = @materialsAmount,
             inspection_fee = @inspectionFee,
             note = coalesce(@note, note),
-            status = case
-              when status = 'accepted' then 'accepted'
-              else 'submitted'
-            end
+            status = 'submitted'
           where id = @offerId
-            and status in ('submitted', 'accepted')
+            and status = 'submitted'
           ''',
           parameters: {
             'offerId': revision['offer_id'],
@@ -1790,7 +2282,42 @@ class PlatformRepository {
             'note': revision['note'],
           },
         );
+        if (changedOffers != 1) {
+          throw const PlatformRuleException(
+            'تعذر تطبيق تعديل العرض لأن حالة الطلب تغيرت.',
+            statusCode: 409,
+          );
+        }
       }
+      await session.execute(
+        '''
+        update public.notifications notification
+        set
+          read_at = coalesce(notification.read_at, now()),
+          data = notification.data || jsonb_build_object(
+            'revision_status', @status,
+            'actionable', false
+          ),
+          push_status = case
+            when notification.push_status in ('pending', 'failed')
+              then 'skipped'
+            else notification.push_status
+          end,
+          push_error = case
+            when notification.push_status in ('pending', 'failed')
+              then 'Offer revision is no longer actionable.'
+            else notification.push_error
+          end
+        where notification.profile_id = @craftsmanId
+          and notification.data ->> 'notification_type' = 'offer_revision'
+          and notification.data ->> 'revision_id' = @revisionId
+        ''',
+        parameters: {
+          'craftsmanId': craftsmanId,
+          'revisionId': revisionId,
+          'status': approved ? 'approved' : 'rejected',
+        },
+      );
       await session.execute(
         '''
         insert into public.notifications (profile_id, title, body, data)
@@ -1831,12 +2358,14 @@ class PlatformRepository {
     required String offerId,
   }) {
     return db.runTx((session) async {
+      await _expireStaleRequests(session);
       final requestRows = await session.select(
         '''
         select id, customer_id, status, payment_method
         from public.service_requests
         where id = @requestId
           and customer_id = @customerId
+          and expires_at > now()
         for update
         ''',
         parameters: {'customerId': customerId, 'requestId': requestId},
@@ -1855,6 +2384,12 @@ class PlatformRepository {
         where id = @offerId
           and request_id = @requestId
           and status = 'submitted'
+          and not exists (
+            select 1
+            from public.offer_revision_requests pending_revision
+            where pending_revision.offer_id = @offerId
+              and pending_revision.status = 'pending'
+          )
         for update
         ''',
         parameters: {'offerId': offerId, 'requestId': requestId},
@@ -1986,6 +2521,25 @@ class PlatformRepository {
       );
       await session.execute(
         '''
+        update public.request_dispatches
+        set expires_at = least(expires_at, now())
+        where request_id = @requestId
+          and expires_at > now()
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      await _closeRequestDispatchNotifications(
+        session,
+        requestId: requestId,
+        status: 'accepted',
+      );
+      await _closeOfferNotifications(
+        session,
+        requestId: requestId,
+        status: 'accepted',
+      );
+      await session.execute(
+        '''
         update public.offers
         set status = case
           when id = @offerId then 'accepted'::public.offer_status
@@ -1994,6 +2548,43 @@ class PlatformRepository {
         where request_id = @requestId and status = 'submitted'
         ''',
         parameters: {'requestId': requestId, 'offerId': offerId},
+      );
+      await session.execute(
+        '''
+        with cancelled_revisions as (
+          update public.offer_revision_requests
+          set
+            status = 'cancelled',
+            response_note = coalesce(
+              response_note,
+              'أُلغي بعد قبول عرض آخر للطلب.'
+            ),
+            responded_at = coalesce(responded_at, now())
+          where request_id = @requestId
+            and status = 'pending'
+          returning id
+        )
+        update public.notifications notification
+        set
+          read_at = coalesce(notification.read_at, now()),
+          data = notification.data || jsonb_build_object(
+            'revision_status', 'cancelled',
+            'actionable', false
+          ),
+          push_status = case
+            when notification.push_status in ('pending', 'failed')
+              then 'skipped'
+            else notification.push_status
+          end,
+          push_error = case
+            when notification.push_status in ('pending', 'failed')
+              then 'Offer revision is no longer actionable.'
+            else notification.push_error
+          end
+        from cancelled_revisions revision
+        where notification.data ->> 'revision_id' = revision.id::text
+        ''',
+        parameters: {'requestId': requestId},
       );
       await session.execute(
         '''
@@ -2992,6 +3583,46 @@ class PlatformRepository {
                   then coalesce(np.messages, true)
                 else coalesce(np.request_updates, true)
               end
+            )
+            and (
+              (
+                coalesce(n.data ->> 'dispatch_notification', 'false') <> 'true'
+                and not (
+                  n.data ->> 'notification_type' = 'order'
+                  and n.title in (
+                    'طلب خدمة جديد',
+                    'إعادة إرسال طلب خدمة'
+                  )
+                )
+              )
+              or exists (
+                select 1
+                from public.service_requests active_request
+                join public.request_dispatches active_dispatch
+                  on active_dispatch.request_id = active_request.id
+                 and active_dispatch.craftsman_id = n.profile_id
+                where active_request.id::text = n.data ->> 'request_id'
+                  and active_request.status in ('submitted', 'offers_received')
+                  and active_request.accepted_offer_id is null
+                  and active_request.expires_at > now()
+                  and active_dispatch.offered_at is null
+                  and active_dispatch.expires_at > now()
+              )
+            )
+            and (
+              coalesce(n.data ->> 'notification_type', '') <> 'offer'
+              or exists (
+                select 1
+                from public.offers active_offer
+                join public.service_requests active_request
+                  on active_request.id = active_offer.request_id
+                where active_offer.id::text = n.data ->> 'offer_id'
+                  and active_request.id::text = n.data ->> 'request_id'
+                  and active_offer.status = 'submitted'
+                  and active_request.status in ('submitted', 'offers_received')
+                  and active_request.accepted_offer_id is null
+                  and active_request.expires_at > now()
+              )
             )
           order by n.created_at
           limit @limit
@@ -4463,6 +5094,71 @@ class PlatformRepository {
           'adminId': adminId,
           'inspectionDue': inspectionDue,
         },
+      );
+      await session.execute(
+        '''
+        update public.offers
+        set status = 'withdrawn', updated_at = now()
+        where request_id = @requestId
+          and status = 'submitted'
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      await session.execute(
+        '''
+        with cancelled_revisions as (
+          update public.offer_revision_requests
+          set
+            status = 'cancelled',
+            response_note = coalesce(
+              response_note,
+              'أُلغي بعد إلغاء الطلب من الإدارة.'
+            ),
+            responded_at = coalesce(responded_at, now())
+          where request_id = @requestId
+            and status = 'pending'
+          returning id
+        )
+        update public.notifications notification
+        set
+          read_at = coalesce(notification.read_at, now()),
+          data = notification.data || jsonb_build_object(
+            'revision_status', 'cancelled',
+            'actionable', false
+          ),
+          push_status = case
+            when notification.push_status in ('pending', 'failed')
+              then 'skipped'
+            else notification.push_status
+          end,
+          push_error = case
+            when notification.push_status in ('pending', 'failed')
+              then 'Offer revision is no longer actionable.'
+            else notification.push_error
+          end
+        from cancelled_revisions revision
+        where notification.data ->> 'revision_id' = revision.id::text
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      await session.execute(
+        '''
+        update public.request_dispatches
+        set expires_at = least(expires_at, now())
+        where request_id = @requestId
+          and expires_at > now()
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      await _closeRequestDispatchNotifications(
+        session,
+        requestId: requestId,
+        status: 'cancelled',
+      );
+      await _closeOfferNotifications(
+        session,
+        requestId: requestId,
+        status: 'cancelled',
       );
       await session.execute(
         '''
@@ -5940,7 +6636,7 @@ class PlatformRepository {
     final value = {
       'enabled': enabled,
       'batch_size': batchSize.clamp(1, 5),
-      'batch_interval_minutes': intervalMinutes.clamp(15, 24 * 60),
+      'batch_interval_minutes': intervalMinutes.clamp(60, 24 * 60),
     };
     return db.runTx((session) async {
       await session.execute(
@@ -6031,14 +6727,25 @@ class PlatformRepository {
       );
     }
     return db.runTx((session) async {
+      await _expireStaleRequests(session);
+      await session.select(
+        '''
+        select pg_advisory_xact_lock(
+          hashtextextended(cast(@requestId as text), 904029)
+        )
+        ''',
+        parameters: {'requestId': requestId},
+      );
       final requestRows = await session.select(
         '''
-        select id, category_id, urgency
+        select id, category_id, urgency, expires_at
         from public.service_requests
         where id = @requestId
           and status in ('submitted', 'offers_received')
           and accepted_offer_id is null
+          and expires_at > now()
         limit 1
+        for update
         ''',
         parameters: {'requestId': requestId},
       );
@@ -6049,6 +6756,26 @@ class PlatformRepository {
         );
       }
       final request = requestRows.single;
+      final activeDispatchRows = await session.select(
+        '''
+        select count(*)::integer as active_count
+        from public.request_dispatches
+        where request_id = @requestId
+          and expires_at > now()
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      final activeDispatchCount = activeDispatchRows.isEmpty
+          ? 0
+          : _intValue(activeDispatchRows.single['active_count']);
+      final remainingCapacity = 5 - activeDispatchCount;
+      if (remainingCapacity <= 0) {
+        throw const PlatformRuleException(
+          'الطلب موزّع حاليًا على خمسة فنيين. انتظر انتهاء الدفعة الحالية.',
+          statusCode: 409,
+        );
+      }
+      final dispatchIds = uniqueIds.take(remainingCapacity).toList();
       final batchRows = await session.select(
         '''
         select coalesce(max(batch_no), 0)::int + 1 as next_batch
@@ -6059,7 +6786,7 @@ class PlatformRepository {
       );
       final batchNo = batchRows.isEmpty ? 1 : batchRows.single['next_batch'];
       var inserted = 0;
-      for (final craftsmanId in uniqueIds) {
+      for (final craftsmanId in dispatchIds) {
         final rows = await session.select(
           '''
           insert into public.request_dispatches (
@@ -6075,9 +6802,21 @@ class PlatformRepository {
             @craftsmanId,
             @batchNo,
             'admin',
-            now() + interval '1 hour',
+            least(active_request.expires_at, now() + interval '1 hour'),
             @adminId
-          where exists (
+          from public.service_requests active_request
+          where active_request.id = @requestId
+            and active_request.category_id = @categoryId
+            and active_request.status in ('submitted', 'offers_received')
+            and active_request.accepted_offer_id is null
+            and active_request.expires_at > now()
+            and (
+              select count(*)
+              from public.request_dispatches active_dispatch
+              where active_dispatch.request_id = active_request.id
+                and active_dispatch.expires_at > now()
+            ) < 5
+            and exists (
             select 1
             from public.craftsman_services cs
             join public.craftsman_profiles cp on cp.profile_id = cs.craftsman_id
@@ -6086,7 +6825,7 @@ class PlatformRepository {
               and cs.category_id = @categoryId
               and cp.is_verified = true
               and p.status = 'active'
-          )
+            )
           on conflict (request_id, craftsman_id) do nothing
           returning id
           ''',
@@ -6359,8 +7098,62 @@ class PlatformRepository {
       batchSize: _intValue(value['batch_size']).clamp(1, 5),
       intervalMinutes: _intValue(
         value['batch_interval_minutes'],
-      ).clamp(15, 24 * 60),
+      ).clamp(60, 24 * 60),
     );
+  }
+
+  Future<void> _lockAndAssertNoDuplicateActiveRequest(
+    MaestroDbSession session, {
+    required String customerId,
+    required String categoryId,
+  }) async {
+    await session.select(
+      '''
+      select pg_advisory_xact_lock(
+        hashtextextended(
+          cast(@customerId as text) || ':' || cast(@categoryId as text),
+          904027
+        )
+      )
+      ''',
+      parameters: {'customerId': customerId, 'categoryId': categoryId},
+    );
+    final active = await session.select(
+      '''
+      select id, public_code
+      from public.service_requests
+      where customer_id = @customerId
+        and category_id = @categoryId
+        and status in (
+          'submitted',
+          'offers_received',
+          'accepted',
+          'on_the_way',
+          'started',
+          'disputed'
+        )
+      order by created_at desc
+      limit 1
+      ''',
+      parameters: {'customerId': customerId, 'categoryId': categoryId},
+    );
+    if (active.isNotEmpty) {
+      final code = active.single['public_code']?.toString();
+      throw PlatformRuleException(
+        code == null || code.isEmpty
+            ? 'يوجد طلب فعال سابق لنفس الخدمة. ألغِه أو أكمله أولًا.'
+            : 'يوجد طلب فعال سابق لنفس الخدمة برقم $code. ألغِه أو أكمله أولًا.',
+        statusCode: 409,
+      );
+    }
+  }
+
+  Future<int> _expireStaleRequests(MaestroDbSession session) async {
+    final rows = await session.select('''
+      select maestro_private.expire_stale_service_requests()
+        as expired_count
+      ''');
+    return rows.isEmpty ? 0 : _intValue(rows.single['expired_count']);
   }
 
   Future<int> _createRequestDispatchRows(
@@ -6371,7 +7164,45 @@ class PlatformRepository {
     required int intervalMinutes,
     String source = 'automation',
     String? adminId,
+    bool onlyIfDue = false,
   }) async {
+    await session.select(
+      '''
+      select pg_advisory_xact_lock(
+        hashtextextended(cast(@requestId as text), 904029)
+      )
+      ''',
+      parameters: {'requestId': requestId},
+    );
+    final activeRequests = await session.select(
+      '''
+      select id
+      from public.service_requests
+      where id = @requestId
+        and status in ('submitted', 'offers_received')
+        and accepted_offer_id is null
+        and expires_at > now()
+      limit 1
+      for update
+      ''',
+      parameters: {'requestId': requestId},
+    );
+    if (activeRequests.isEmpty) return 0;
+    if (onlyIfDue) {
+      final dueRows = await session.select(
+        '''
+        select
+          count(rd.id) = 0
+          or coalesce(max(rd.expires_at), request.created_at) <= now() as due
+        from public.service_requests request
+        left join public.request_dispatches rd on rd.request_id = request.id
+        where request.id = @requestId
+        group by request.id
+        ''',
+        parameters: {'requestId': requestId},
+      );
+      if (dueRows.isEmpty || dueRows.single['due'] != true) return 0;
+    }
     final batchRows = await session.select(
       '''
       select coalesce(max(batch_no), 0)::int + 1 as next_batch
@@ -6396,9 +7227,13 @@ class PlatformRepository {
         candidates.craftsman_id,
         @batchNo,
         @source,
-        now() + cast(@intervalMinutes as integer) * interval '1 minute',
+        least(
+          active_request.expires_at,
+          now() + cast(@intervalMinutes as integer) * interval '1 minute'
+        ),
         cast(@adminId as uuid)
-      from (
+      from public.service_requests active_request
+      cross join lateral (
         select
           cs.craftsman_id,
           (
@@ -6425,6 +7260,11 @@ class PlatformRepository {
         order by daily_dispatches asc, cp.completed_jobs asc, random()
         limit @batchSize
       ) candidates
+      where active_request.id = @requestId
+        and active_request.category_id = @categoryId
+        and active_request.status in ('submitted', 'offers_received')
+        and active_request.accepted_offer_id is null
+        and active_request.expires_at > now()
       on conflict (request_id, craftsman_id) do nothing
       ''',
       parameters: {
@@ -6440,6 +7280,7 @@ class PlatformRepository {
   }
 
   Future<int> _dispatchDueRequestBatches(MaestroDbSession session) async {
+    await _expireStaleRequests(session);
     final settings = await _requestAutomationSettings(session);
     if (!settings.enabled) return 0;
     final dueRequests = await session.select('''
@@ -6452,6 +7293,7 @@ class PlatformRepository {
       left join public.request_dispatches rd on rd.request_id = sr.id
       where sr.status in ('submitted', 'offers_received')
         and sr.accepted_offer_id is null
+        and sr.expires_at > now()
       group by sr.id
       having count(rd.id) = 0
         or coalesce(max(rd.expires_at), sr.created_at) <= now()
@@ -6466,6 +7308,7 @@ class PlatformRepository {
         categoryId: request['category_id'].toString(),
         batchSize: settings.batchSize,
         intervalMinutes: settings.intervalMinutes,
+        onlyIfDue: true,
       );
       if (inserted <= 0) continue;
       await _notifyCurrentRequestDispatchBatch(
@@ -6482,6 +7325,7 @@ class PlatformRepository {
     MaestroDbSession session, {
     required String requestId,
     required bool urgent,
+    bool redispatched = false,
   }) {
     return session.execute(
       '''
@@ -6492,7 +7336,10 @@ class PlatformRepository {
         @body,
         jsonb_build_object(
           'request_id', @requestId:uuid,
-          'notification_type', 'order'
+          'notification_type', 'order',
+          'redispatched', @redispatched:boolean,
+          'dispatch_notification', true,
+          'actionable', true
         )
       from public.request_dispatches rd
       where rd.request_id = @requestId
@@ -6504,6 +7351,7 @@ class PlatformRepository {
       ''',
       parameters: {
         'requestId': requestId,
+        'redispatched': redispatched,
         'body': urgent
             ? 'يوجد طلب عاجل جديد ضمن تخصصك.'
             : 'يوجد طلب جديد ضمن تخصصك.',
@@ -6511,10 +7359,68 @@ class PlatformRepository {
     );
   }
 
-  Future<void> _notifyAdminsAboutManualRequest(
+  Future<int> _renotifyLatestUnansweredDispatchBatch(
+    MaestroDbSession session, {
+    required String requestId,
+    required bool urgent,
+    required int intervalMinutes,
+  }) async {
+    final rows = await session.select(
+      '''
+      with refreshed as (
+        update public.request_dispatches dispatch
+        set
+          notified_at = now(),
+          expires_at = least(
+            request.expires_at,
+            now() + cast(@intervalMinutes as integer) * interval '1 minute'
+          )
+        from public.service_requests request
+        where dispatch.request_id = @requestId
+          and request.id = dispatch.request_id
+          and dispatch.batch_no = (
+            select max(latest.batch_no)
+            from public.request_dispatches latest
+            where latest.request_id = @requestId
+          )
+          and dispatch.offered_at is null
+        returning dispatch.craftsman_id
+      ),
+      queued as (
+        insert into public.notifications (profile_id, title, body, data)
+        select
+          refreshed.craftsman_id,
+          'إعادة إرسال طلب خدمة',
+          @body,
+          jsonb_build_object(
+            'request_id', @requestId:uuid,
+            'notification_type', 'order',
+            'redispatched', true,
+            'dispatch_notification', true,
+            'actionable', true
+          )
+        from refreshed
+        returning id
+      )
+      select count(*)::int as notified_count
+      from queued
+      ''',
+      parameters: {
+        'requestId': requestId,
+        'intervalMinutes': intervalMinutes,
+        'body': urgent
+            ? 'أعاد العميل إرسال طلب عاجل ضمن تخصصك.'
+            : 'أعاد العميل إرسال طلب خدمة ضمن تخصصك.',
+      },
+    );
+    return rows.isEmpty ? 0 : _intValue(rows.single['notified_count']);
+  }
+
+  Future<int> _notifyAdminsAboutManualRequest(
     MaestroDbSession session, {
     required String requestId,
     required String publicCode,
+    bool redispatched = false,
   }) {
     return session.execute(
       '''
@@ -6525,7 +7431,8 @@ class PlatformRepository {
         @body,
         jsonb_build_object(
           'request_id', @requestId:uuid,
-          'notification_type', 'admin_request_dispatch'
+          'notification_type', 'admin_request_dispatch',
+          'redispatched', @redispatched:boolean
         )
       from public.profiles p
       where p.role = 'admin'
@@ -6534,9 +7441,90 @@ class PlatformRepository {
       ''',
       parameters: {
         'requestId': requestId,
+        'redispatched': redispatched,
         'body':
-            'الطلب ${publicCode.isEmpty ? requestId : publicCode} ينتظر اختيار فني من الإدارة.',
+            '${redispatched ? 'أعاد العميل إرسال الطلب' : 'الطلب'} ${publicCode.isEmpty ? requestId : publicCode} وينتظر اختيار فني من الإدارة.',
       },
+    );
+  }
+
+  Future<void> _closeRequestDispatchNotifications(
+    MaestroDbSession session, {
+    required String requestId,
+    required String status,
+    String? craftsmanId,
+  }) {
+    return session.execute(
+      '''
+      update public.notifications notification
+      set
+        read_at = coalesce(notification.read_at, now()),
+        data = notification.data || jsonb_build_object(
+          'dispatch_status', @status,
+          'actionable', false
+        ),
+        push_status = case
+          when notification.push_status in ('pending', 'failed')
+            then 'skipped'
+          else notification.push_status
+        end,
+        push_error = case
+          when notification.push_status in ('pending', 'failed')
+            then 'Dispatch notification is no longer actionable.'
+          else notification.push_error
+        end
+      where notification.data ->> 'request_id' = @requestId
+        and (
+          cast(@craftsmanId as uuid) is null
+          or notification.profile_id = cast(@craftsmanId as uuid)
+        )
+        and (
+          notification.data ->> 'dispatch_notification' = 'true'
+          or (
+            notification.data ->> 'notification_type' = 'order'
+            and notification.title in (
+              'طلب خدمة جديد',
+              'إعادة إرسال طلب خدمة'
+            )
+          )
+        )
+      ''',
+      parameters: {
+        'requestId': requestId,
+        'status': status,
+        'craftsmanId': craftsmanId,
+      },
+    );
+  }
+
+  Future<void> _closeOfferNotifications(
+    MaestroDbSession session, {
+    required String requestId,
+    required String status,
+  }) {
+    return session.execute(
+      '''
+      update public.notifications notification
+      set
+        read_at = coalesce(notification.read_at, now()),
+        data = notification.data || jsonb_build_object(
+          'offer_status', @status,
+          'actionable', false
+        ),
+        push_status = case
+          when notification.push_status in ('pending', 'failed')
+            then 'skipped'
+          else notification.push_status
+        end,
+        push_error = case
+          when notification.push_status in ('pending', 'failed')
+            then 'Offer notification is no longer actionable.'
+          else notification.push_error
+        end
+      where notification.data ->> 'request_id' = @requestId
+        and notification.data ->> 'notification_type' = 'offer'
+      ''',
+      parameters: {'requestId': requestId, 'status': status},
     );
   }
 
@@ -6575,7 +7563,16 @@ class PlatformRepository {
     var role = knownRole;
     if (role == null) {
       final roleRows = await session.select(
-        'select role from public.profiles where id = @profileId',
+        '''
+        with expiry_sweep as (
+          select maestro_private.expire_stale_service_requests()
+            as expired_count
+        )
+        select profile.role
+        from public.profiles profile
+        cross join expiry_sweep
+        where profile.id = @profileId
+        ''',
         parameters: {'profileId': profileId},
       );
       if (roleRows.isEmpty) return [];
@@ -6642,6 +7639,35 @@ class PlatformRepository {
           end as craftsman_location_updated_at,
           accepted_p.full_name as craftsman_name,
           accepted_p.avatar_url as craftsman_avatar_url,
+          greatest(
+            sr.created_at,
+            coalesce(sr.last_redispatched_at, sr.created_at),
+            coalesce(
+              (
+                select max(redispatch_rd.notified_at)
+                from public.request_dispatches redispatch_rd
+                where redispatch_rd.request_id = sr.id
+              ),
+              sr.created_at
+            )
+          ) + interval '1 hour' as next_redispatch_at,
+          (
+            sr.status in ('submitted', 'offers_received')
+            and sr.accepted_offer_id is null
+            and sr.expires_at > now()
+            and now() >= greatest(
+              sr.created_at,
+              coalesce(sr.last_redispatched_at, sr.created_at),
+              coalesce(
+                (
+                  select max(redispatch_check.notified_at)
+                  from public.request_dispatches redispatch_check
+                  where redispatch_check.request_id = sr.id
+                ),
+                sr.created_at
+              )
+            ) + interval '1 hour'
+          ) as can_redispatch,
           timeline.submitted_at,
           timeline.offers_received_at,
           timeline.accepted_at,
@@ -6720,6 +7746,7 @@ class PlatformRepository {
           sr.voice_note_url,
           sr.created_at,
           sr.updated_at,
+          sr.expires_at,
           sr.accepted_offer_id,
           sr.payment_method,
           sr.cancellation_mode,
@@ -6750,6 +7777,16 @@ class PlatformRepository {
           o.id as my_offer_id,
           o.status as my_offer_status,
           o.total_amount as my_offer_amount,
+          latest_revision.id as revision_id,
+          latest_revision.status as revision_status,
+          latest_revision.total_amount as revision_total_amount,
+          latest_revision.labor_amount as revision_labor_amount,
+          latest_revision.materials_amount as revision_materials_amount,
+          latest_revision.inspection_fee as revision_inspection_fee,
+          latest_revision.note as revision_note,
+          latest_revision.response_note as revision_response_note,
+          latest_revision.created_at as revision_created_at,
+          latest_revision.responded_at as revision_responded_at,
           rp.total_amount as payment_total_amount,
           rp.inspection_amount as payment_inspection_amount,
           rp.wallet_reserved_amount,
@@ -6784,6 +7821,13 @@ class PlatformRepository {
         left join public.offers o
           on o.request_id = sr.id
          and o.craftsman_id = @profileId
+        left join lateral (
+          select revision.*
+          from public.offer_revision_requests revision
+          where revision.offer_id = o.id
+          order by revision.created_at desc, revision.id desc
+          limit 1
+        ) latest_revision on true
         left join public.request_payments rp on rp.request_id = sr.id
         left join lateral (
           select
@@ -7109,6 +8153,16 @@ class PlatformRuleException implements Exception {
 
   @override
   String toString() => 'PlatformRuleException($statusCode): $message';
+}
+
+class RequestRedispatchCooldownException extends PlatformRuleException {
+  RequestRedispatchCooldownException(this.retryAt)
+    : super(
+        'يمكن إعادة إرسال الطلب مرة واحدة فقط كل 60 دقيقة.',
+        statusCode: 429,
+      );
+
+  final DateTime retryAt;
 }
 
 const Set<String> _walletTopupStatuses = {'open', 'coming_soon', 'closed'};
