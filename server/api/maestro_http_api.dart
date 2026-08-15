@@ -29,8 +29,10 @@ class MaestroHttpApi {
   final CloudinaryClient cloudinary;
   final NotificationPushDispatcher? pushDispatcher;
 
-  bool get _isProduction =>
-      !TestLoginPolicy.fromEnvironment(environment).environmentAllowsTestLogin;
+  TestLoginPolicy get _testLoginPolicy =>
+      TestLoginPolicy.fromEnvironment(environment);
+
+  bool get _isProduction => _testLoginPolicy.isProduction;
 
   Future<void> handle(HttpRequest request) async {
     _addCorsHeaders(request.response);
@@ -52,7 +54,11 @@ class MaestroHttpApi {
         return;
       }
       if (request.method == 'GET' && path == '/config') {
-        final enabled = !_isProduction && await repository.testLoginEnabled();
+        final policy = _testLoginPolicy;
+        final enabled =
+            policy.environmentAllowsTestLogin &&
+            policy.hasAnyAllowlistedPhone &&
+            await repository.testLoginEnabled();
         await _json(request.response, HttpStatus.ok, {
           'test_login_enabled': enabled,
         });
@@ -738,7 +744,10 @@ class MaestroHttpApi {
   }
 
   Future<void> _testLogin(HttpRequest request) async {
-    if (_isProduction || !await repository.testLoginEnabled()) {
+    final testLoginPolicy = _testLoginPolicy;
+    if (!testLoginPolicy.environmentAllowsTestLogin ||
+        !testLoginPolicy.hasAnyAllowlistedPhone ||
+        !await repository.testLoginEnabled()) {
       throw const PlatformRuleException(
         'الدخول التجريبي غير مفعّل.',
         statusCode: 403,
@@ -754,7 +763,6 @@ class MaestroHttpApi {
     }
     final role = _validatedRole(body['role']?.toString());
     _enforceAppRole(request, role);
-    final testLoginPolicy = TestLoginPolicy.fromEnvironment(environment);
     if (!testLoginPolicy.allows(phone: phone, role: role)) {
       throw const PlatformRuleException(
         'استخدم رقم الاختبار المخصص لنوع الحساب الذي اخترته.',
@@ -1621,9 +1629,9 @@ class MaestroHttpApi {
       return true;
     }
     if (path == '/admin/settings/test-login' && request.method == 'PUT') {
-      if (_isProduction) {
+      if (!_testLoginPolicy.environmentAllowsTestLogin) {
         throw const PlatformRuleException(
-          'لا يمكن تفعيل الدخول التجريبي في بيئة الإنتاج.',
+          'لا يمكن تفعيل الدخول التجريبي من الإدارة ما لم يسمح به إعداد الخادم.',
           statusCode: 403,
         );
       }

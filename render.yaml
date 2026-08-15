@@ -36,3 +36,14 @@ services:
         sync: false
       - key: MAESTRO_ADMIN_PHONE
         sync: false
+      # Test login remains disabled unless this is explicitly changed to true
+      # in Render and the database admin toggle is also enabled. Every request
+      # is still restricted to the exact role-specific phone allowlist.
+      - key: TEST_LOGIN_ENABLED
+        value: false
+      - key: MAESTRO_TEST_CUSTOMER_PHONE
+        sync: false
+      - key: MAESTRO_TEST_CRAFTSMAN_PHONE
+        sync: false
+      - key: MAESTRO_TEST_ADMIN_PHONE
+        sync: false
